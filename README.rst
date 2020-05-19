@@ -1,5 +1,5 @@
 ===============================
-package-name
+Machine Learning Ocean Boundary Layer (ML-Ocean-BL)
 ===============================
 
 .. image:: https://img.shields.io/circleci/project/github/NCAR/package-name/master.svg?style=for-the-badge&logo=circleci
@@ -24,17 +24,17 @@ package-name
 
 See documentation_ for more information.
 
-.. _documentation: https://package-name.readthedocs.io
+.. _documentation: https://ml-ocean-bl.readthedocs.io
 
 
 Installation
 ------------
 
-package-name can be installed from PyPI with pip:
+ml-olcean-bl can be installed from PyPI with pip:
 
 .. code-block:: bash
 
-    pip install package-name
+    pip install ml-ocean-bl
 
 
 It is also available from `conda-forge` for conda installations:

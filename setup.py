@@ -10,7 +10,8 @@ if exists('requirements.txt'):
     with open('requirements.txt') as f:
         install_requires = f.read().strip().split('\n')
 else:
-    install_requires = ['dask', 'xarray']
+    install_requires = ['dask', 'xarray', 'numpy', 'tensorflow', 'pandas',
+                        'scikit-learn', 'netcdf4', 'scipy']
 
 if exists('README.rst'):
     with open('README.rst') as f:
@@ -20,12 +21,12 @@ else:
 
 
 setup(
-    name='package_name',
-    description='short_description',
+    name='ml-ocean-bl',
+    description='Machine Learning Ocean Boundary Layer',
     long_description=long_description,
-    maintainer='maintainer_full_name',
-    maintainer_email='maintainer_email',
-    url='https://github.com/github_username_or_organization/repo_name',
+    maintainer='David John Gagne, Dallas Foster, Dan Whitt',
+    maintainer_email='dgagne@ucar.edu',
+    url='https://github.com/NCAR/ml-ocean-bl',
     packages=find_packages(),
     include_package_data=True,
     install_requires=install_requires,
