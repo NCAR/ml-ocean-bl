@@ -1,3 +1,22 @@
+####################################################################################
+####################################################################################
+########################### File Description #######################################
+####################################################################################
+####################################################################################
+
+# This file creates a class that imports preprocessed sss data, sst data, and ssh data 
+# It currently hosts a number of plot creation functions. It will hold all of the code
+# for the potential models that we will test.
+
+## TO DO
+# Add argo data
+# Add models
+# Add plot creation
+
+
+####################################################################################
+########################### Import libraries #######################################
+####################################################################################
 import xarray as xr
 import matplotlib.pyplot as plt
 import pandas as pd
@@ -8,19 +27,141 @@ import cartopy
 import cartopy.crs as ccrs
 from mpl_toolkits.basemap import maskoceans
 import tensorflow as tf
+import tensorflow.keras as keras
+import gpflow as gpf
 
-class sss_sst_ssh:
+####################################################################################
+########################### Import Data ############################################
+####################################################################################
+
+            
+class dataset:
+    def __init__(self, x_data, lon, lat, y_data, m_lon, m_lat, lat_bounds, lon_bounds):
+        self.X_data = np.stack(x_data, axis=-1)
+        lat_mask = (lat < lat_bounds[1]) & (lat > lat_bounds[0])
+        lon_mask = (lon < lon_bounds[1]) & (lon > lon_bounds[0])
+        self.mask = np.isfinite(x_data[0].mean(axis=0))
+        self.mask[~lat_mask, :] = False
+        self.mask[:, ~lon_mask] = False
+        self.X_data = np.stack(x_data, axis=-1)[:, self.mask, :]
+        
+        [LAT, LON] = np.meshgrid(lat, lon, indexing='ij')
+        self.X_loc = np.stack((LON[self.mask], LAT[self.mask]), axis=-1)
+        self.y_data = y_data
+        self.y_loc = np.stack((m_lon, m_lat), axis=-1)
+        self.lat_bounds = lat_bounds
+        self.lon_bounds = lon_bounds
+        
+    def normalize(self, train_index):
+        
+        for i in range(self.X_data.shape[-1]):
+            self.X_data[:, :, i] = normalize(self.X_data[:, :, i], train_index)
+        
+        self.y_data = normalize(self.y_data, train_index)
+        
+    def get_index(self, index):
+        mask = (self.y_loc[index, :, 1]<self.lat_bounds[1]) & (self.y_loc[index, :, 1]>self.lat_bounds[0]) & \
+                (self.y_loc[index, :, 0]<self.lon_bounds[1]) & (self.y_loc[index, :, 0]>self.lon_bounds[0])
+        y = self.y_data[index, mask].reshape(-1, 1)
+        y_loc = self.y_loc[index, mask, :]
+        return self.X_data[index], self.X_loc, y, y_loc
+
+####################################################################################
+########################### Preprocess Models ######################################
+####################################################################################
+
+def train_test_val_indices(n, n_train, n_test):
+    n_validate = n - n_train -  n_test
+    assert n_validate > 0, print('Validation size must be positive')
+    i = np.arange(n)
+    rng = np.random.default_rng(10)
+    np.random.shuffle(i)
+    return i[:n_train], i[n_train:n_train+n_test], i[n_train+n_test:]
+
+
+
+####################################################################################
+########################### Define Models ##########################################
+####################################################################################
+
+class HaversineMatern(gpf.kernels.Kernel):
     def __init__(self):
-        with xr.open_dataset('sss_sst_ssh_normed_anomalies_weekly.nc') as ds:
-            print(ds)
-            self.sal = ds.norm_salinity
-            self.temp = ds.norm_temperature
-            self.height = ds.norm_height
-            self.lat = ds.lat.values
-            self.lon = ds.lon.values
-            self.time = ds.time.values
-        self.a = 1
+        super().__init__()
+        self.amplitude = gpf.Parameter(10.0, transform=positive())
+        self.length_scale = gpf.Parameter(1.0, transform=positive())
+        
+    def K(self, X, X2=None):
+        if X2 is None:
+            X2 = X
+        dist = tf.linalg.matmul(X, X2, transpose_b=True)
+        dist = tf.clip_by_value(dist, -1, 1)
+        dist = tf.math.acos(dist)
+        return self.matern(dist)  # this returns a 2D tensor
+
+    def K_diag(self, X):
+        dist = tf.math.acos(tf.clip_by_value(tf.linalg.matmul(X, X, transpose_b=True), -1, 1))
+        return tf.reshape(tf.linalg.diag_part(self.matern(dist)), (-1,)) # this returns a 1D tensor
     
+    def matern(self, dist):
+        Kl = dist * tf.cast(tf.math.sqrt(3.0), dtype='float64')*self.length_scale
+        Kl = self.amplitude*(1. + Kl) * tf.exp(-Kl)
+        return Kl
+
+
+class Linear(keras.Model):
+    def __init__(self, input_dim, n_features, x_l, dtype='float64', **kwargs):
+        super(Linear, self).__init__(name='linear_projection', dtype='float64', **kwargs)
+        self.input_dim = input_dim
+        self.n_features = n_features
+        
+        self.x_l = np.stack( (np.sin(np.deg2rad(90.0-x_l[:,1]))*np.cos(np.deg2rad(x_l[:,0]+180.0)),  
+                     np.sin(np.deg2rad(90.0-x_l[:,1]))*np.sin(np.deg2rad(x_l[:,0]+180.0)),
+                     np.cos(np.deg2rad(90.0-x_l[:,1]))), axis=-1)
+        self.x_l = tf.cast(self.x_l, dtype='float64')
+        
+        w_init = tf.initializers.GlorotNormal()
+        self.w = tf.Variable(initial_value=w_init(shape=(self.input_dim, self.n_features),
+                                    dtype='float64'),trainable=True, 
+                            name = 'linear')
+        b_init = tf.initializers.GlorotNormal()
+        self.b = tf.Variable(initial_value=b_init(shape=(self.input_dim,),
+                                    dtype='float64'), trainable=True, 
+                            name = 'bias')
+
+        self.k = HaversineMatern()
+        self.m = gpf.models.GPR(data=(self.x_l, self.x_l[:,0]), kernel=self.k, mean_function=None)
+        
+    def call(self, y_l, X_d, y_d):
+        # Linear Map
+        x = tf.math.multiply(X_d, self.w)
+        x = tf.math.reduce_sum(x, axis=1) + self.b
+        x = tf.reshape(x, (-1, 1))
+        self.m.data = data_input_to_tensor((self.x_l, x))
+        
+        # Gaussian Process
+        self.y_l = np.stack( (np.sin(np.deg2rad(90.0-y_l[:,1]))*np.cos(np.deg2rad(y_l[:,0]+180.0)),  
+                     np.sin(np.deg2rad(90.0-y_l[:,1]))*np.sin(np.deg2rad(y_l[:,0]+180.0)),
+                     np.cos(np.deg2rad(90.0-y_l[:,1]))), axis=-1)
+        self.y_l = tf.cast(self.y_l, dtype='float64')
+        mean, var = self.m.predict_f(self.y_l)
+        
+#         loss_mse = 0.5*tf.linalg.matmul((y_d - mean), (y_d - mean)/var, transpose_a = True)
+        loss_mse = tf.math.reduce_mean( (y_d-mean)*(y_d-mean)/var)
+        self.add_loss(loss_mse)
+        return x, mean, var
+    
+    def predict(self, X_d):
+        x = tf.math.multiply(X_d, self.w)
+        x = tf.math.reduce_sum(x, axis=1) + self.b
+        x = tf.reshape(x, (-1, 1))
+        return x
+
+
+
+
+####################################################################################
+########################### Plotting functions #####################################
+####################################################################################
 def plot_stats(var, time, lats, lons, text, quantile = 0.5):
     import matplotlib.gridspec as gridspec
     # Plot the 'stat' statistic (either 'mean', or 'std') of variable 'var'
