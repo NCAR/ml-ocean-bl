@@ -128,8 +128,7 @@ class AngleMatern(Kernel):
     def __init__(self):
         super().__init__()
         self.amplitude = gpf.Parameter(10.0, transform=positive())
-        self.length_scale = gpf.Parameter(1.0, transform=positive(), 
-                                         prior=tfd.HalfCauchy(loc=0, scale=2))
+        self.length_scale = gpf.Parameter(1.0, transform=positive())
         
     def K(self, X, X2=None):
         if X2 is None:
@@ -301,7 +300,7 @@ class Linear(keras.Model):
         self.m = noisyGPR(data=(self.x_l, self.x_l[:,0], self.x_l[:,0]), kernel=self.k, mean_function=None)
         
         
-    def call(self, y_l, X_d, y_d):
+    def call(self, y_l, X_d):
         r"""
         Produces an estimate x for the latent variable x = f(X) + noise
         With that estimate x, projects to the output space m = Lx + var
@@ -324,10 +323,39 @@ class Linear(keras.Model):
         
         # Get mean, variance predictions
         mean, var = self.m.predict_f(self.y_l)
-        
-        loss_mse = tf.math.reduce_mean( (y_d-mean)*(y_d-mean)/var)
-        self.add_loss(loss_mse)
         return x, mean, var
+    
+    def log_prob(self, y_pred, y_true, loss=False):
+        x, m, v = y_pred
+        # Priors for gp kernel hyperparameters
+        amplitude = tfd.LogNormal(loc=0.0, scale=np.float64(1.0))
+        amp_loss = -amplitude.log_prob(self.k.amplitude)
+        
+        length_scale = tfd.LogNormal(loc=0.0, scale=np.float64(1.0))
+        ls_loss = -length_scale.log_prob(self.k.length_scale)
+        
+        # Priors for input, output noise
+        input_noise = tfd.Independent(tfd.LogNormal(loc=tf.cast(tf.fill([self.input_dim], 0.0), dtype='float64'),
+                                    scale=tf.cast(tf.fill([self.input_dim], 1.0), dtype='float64')),
+                                     reinterpreted_batch_ndims=1)
+        input_noise_loss = -input_noise.log_prob(self.input_noise)
+
+        
+        gp_loss = -self.m.log_marginal_likelihood()
+        
+        
+        # Likelihood
+        obs = tfd.Independent(tfd.Normal(loc=tf.cast(y_true.reshape(-1,), dtype='float64'), scale=v),
+                              reinterpreted_batch_ndims=1)
+        obs_loss = -obs.log_prob(mean)
+        
+
+        total_loss = 0.0
+        total_loss += gp_loss + obs_loss
+        if loss:
+            return total_loss
+        else:
+            return -total_loss
     
     def predict(self, X_d):
         r"""
@@ -412,7 +440,7 @@ class Linear_Joint_Prob(keras.Model):
         self.k = models.AngleMatern()
         self.kmm = self.k(self.x_l)
         
-    def call(self, y_l, X_d, y_d):
+    def call(self, y_l, X_d):
         r"""
         Produces an estimate x for the latent variable x = f(X) + noise
         With that estimate x, projects to the output space m = Lx + var
@@ -431,7 +459,7 @@ class Linear_Joint_Prob(keras.Model):
                      np.sin(np.deg2rad(90.0-y_l[:,1]))*np.sin(np.deg2rad(y_l[:,0]+180.0)),
                      np.cos(np.deg2rad(90.0-y_l[:,1]))), axis=-1)
         self.y_l = tf.cast(self.y_l, dtype='float64')
-        self.output_dim = y_d.shape[0]
+        self.output_dim = y_l.shape[0]
         
         knn = self.k(self.y_l)
         kmn = self.k(self.x_l, self.y_l)
@@ -450,8 +478,12 @@ class Linear_Joint_Prob(keras.Model):
         var += tf.matmul(tf.matmul(Lp, tf.linalg.diag(self.input_noise)), 
                                    Lp, 
                                    transpose_b=True)
-        var_d = tf.linalg.diag_part(var)
-
+        var_d = tf.reshape(tf.linalg.diag_part(var), (-1, ))
+        
+        return (x, mean, var_d)
+    
+    def log_prob(self, y_pred, y_true, loss=False):
+        x, m, v = y_pred
         # Priors for gp kernel hyperparameters
         amplitude = tfd.LogNormal(loc=0.0, scale=np.float64(1.0))
         amp_loss = -amplitude.log_prob(self.k.amplitude)
@@ -460,30 +492,34 @@ class Linear_Joint_Prob(keras.Model):
         ls_loss = -length_scale.log_prob(self.k.length_scale)
         
         # Priors for input, output noise
-        input_noise = tfd.Independent(tfd.LogNormal(loc=tf.cast(tf.fill([input_dim], 0.0), dtype='float64'),
-                                    scale=tf.cast(tf.fill([input_dim], 1.0), dtype='float64')),
+        input_noise = tfd.Independent(tfd.LogNormal(loc=tf.cast(tf.fill([self.input_dim], 0.0), dtype='float64'),
+                                    scale=tf.cast(tf.fill([self.input_dim], 1.0), dtype='float64')),
                                      reinterpreted_batch_ndims=1)
         input_noise_loss = -input_noise.log_prob(self.input_noise)
 
         output_noise = tfd.LogNormal(loc=0.0, scale=np.float64(1.0))
         output_noise_loss = -output_noise.log_prob(self.output_noise)
+        
         # Gaussian Process Prior
-        gp = tfd.MultivariateNormalTriL(loc=tf.cast(tf.fill([input_dim], 0.0), dtype='float64'), scale_tril=L)
+        k_diag = tf.linalg.diag_part(self.kmm)
+        ks = tf.linalg.set_diag(self.kmm, k_diag + self.input_noise)
+        L = tf.linalg.cholesky(ks)
+        gp = tfd.MultivariateNormalTriL(loc=tf.cast(tf.fill([self.input_dim], 0.0), dtype='float64'), scale_tril=L)
         gp_loss = -gp.log_prob(tf.reshape(x, (-1,)))
         
         
         # Likelihood
-        obs = tfd.Independent(tfd.Normal(loc=tf.cast(y_d.reshape(-1,), dtype='float64'), scale=tf.reshape(var_d, (-1,))),
+        obs = tfd.Independent(tfd.Normal(loc=tf.cast(y_true.reshape(-1,), dtype='float64'), scale=v),
                               reinterpreted_batch_ndims=1)
         obs_loss = -obs.log_prob(mean)
         
-        self.add_loss(amp_loss)
-        self.add_loss(ls_loss)
-        self.add_loss(input_noise_loss)
-        self.add_loss(output_noise_loss)
-        self.add_loss(gp_loss)
-        self.add_loss(obs_loss)
-        return x, mean, var_d
+
+        total_loss = amp_loss + ls_loss + input_noise_loss + output_noise_loss 
+        total_loss += gp_loss + obs_loss
+        if loss:
+            return total_loss
+        else:
+            return -total_loss
     
                     
     def predict(self, X_d):
