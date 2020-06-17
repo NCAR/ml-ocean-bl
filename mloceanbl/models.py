@@ -323,19 +323,13 @@ class Linear(keras.Model):
         
         # Get mean, variance predictions
         mean, var = self.m.predict_f(self.y_l)
-        return x, mean, var
+        return x, tf.reshape(mean, (-1,)), tf.reshape(var, (-1,))
     
     def log_prob(self, y_pred, y_true, loss=False):
         x, m, v = y_pred
-        # Priors for gp kernel hyperparameters
-        amplitude = tfd.LogNormal(loc=0.0, scale=np.float64(1.0))
-        amp_loss = -amplitude.log_prob(self.k.amplitude)
         
-        length_scale = tfd.LogNormal(loc=0.0, scale=np.float64(1.0))
-        ls_loss = -length_scale.log_prob(self.k.length_scale)
-        
-        # Priors for input, output noise
-        input_noise = tfd.Independent(tfd.LogNormal(loc=tf.cast(tf.fill([self.input_dim], 0.0), dtype='float64'),
+        # Priors for input noise
+        input_noise = tfd.Independent(tfd.HalfCauchy(loc=tf.cast(tf.fill([self.input_dim], 0.0), dtype='float64'),
                                     scale=tf.cast(tf.fill([self.input_dim], 1.0), dtype='float64')),
                                      reinterpreted_batch_ndims=1)
         input_noise_loss = -input_noise.log_prob(self.input_noise)
@@ -347,7 +341,7 @@ class Linear(keras.Model):
         # Likelihood
         obs = tfd.Independent(tfd.Normal(loc=tf.cast(y_true.reshape(-1,), dtype='float64'), scale=v),
                               reinterpreted_batch_ndims=1)
-        obs_loss = -obs.log_prob(mean)
+        obs_loss = -obs.log_prob(m)
         
 
         total_loss = 0.0
@@ -366,170 +360,6 @@ class Linear(keras.Model):
         x = tf.reshape(x, (-1, 1))
         return x
     
-class Linear_Joint_Prob(keras.Model):
-    r"""
-    Implements linear model x = \sum_{n=1}^{num_features} w[n].X[n] + b + noise
-    with training model y = Lx + V, where L and V are obtained via GP regression.
-    Input noise is estimated along with parameters w and b.
-    
-    Input arguments - input_dim, number of rows of X
-                    - n_features, number of columns of X
-                    - x_l,  locations of inputs, shape (input_dim, 2)
-                            columns house (lon,lat) coordinates respectively.
-                    - y_l, locations of training data
-                    - y_d, training data values
-                            
-    Output arguments - x, estimate of x = f(X) + noise
-                     - m, mean estimate of m = Lx + V
-                     - v, diagonal variance of gp covariance V
-                     
-    Parameters       - w, linear weight matrix, shape (input_dim, n_features)
-                     - b, bias, shape (input_dim, )
-                     - input_noise, input-dependent noise estimate, shape (input_dim,)
-                         gives estimate of variances along with Linear.m.likelihood.variance
-    
-    Inherited Parameters - .m.likelihood.variance, constant variance estimate
-                         - .k.amplitude, kernel amplitude
-                         - .k.length_Scale, kernel length scale, 1 / correlation distance
-    
-    Joint probability distribution is calculated as
-    p(x|y_d, params) = p(x, y_d, params)/p(y_d)
-    p(x, y_d, params) = p(y_d|x, params)*p(x|params)*p(params)
-    where p(x|params) is modeled using a gaussian likelihood prior
-    p(params) = p(amplitude)*p(length_scale)*p(input_noise)*p(output_noise)
-    where the params are given not very informative log normal distributions (to keep them away from zero)
-    
-    """
-    def __init__(self, input_dim, n_features, x_l, dtype='float64', **kwargs):
-        super(Linear, self).__init__(name='linear_projection', dtype='float64', **kwargs)
-        
-        # Sizes
-        self.input_dim = input_dim
-        self.n_features = n_features
-        
-        # Convet lat lon to (x,y,z) for kernel use.        
-        self.x_l = np.stack( (np.sin(np.deg2rad(90.0-x_l[:,1]))*np.cos(np.deg2rad(x_l[:,0]+180.0)),  
-                     np.sin(np.deg2rad(90.0-x_l[:,1]))*np.sin(np.deg2rad(x_l[:,0]+180.0)),
-                     np.cos(np.deg2rad(90.0-x_l[:,1]))), axis=-1)
-        self.x_l = tf.cast(self.x_l, dtype='float64')
-        
-        
-        # Parameters, w, b, input_noise
-        # Linear weights
-        w_init = tf.initializers.GlorotNormal()
-        self.w = tf.Variable(initial_value=w_init(shape=(self.input_dim, self.n_features),
-                                    dtype='float64'),trainable=True, 
-                            name = 'linear')
-        
-        # bias weights
-        b_init = tf.initializers.GlorotNormal()
-        self.b = tf.Variable(initial_value=b_init(shape=(self.input_dim,),
-                                    dtype='float64'), trainable=True, 
-                            name = 'bias')
-        
-        # estimate of input noise
-        self.input_noise = tf.Variable(initial_value=tf.ones([input_dim,], dtype='float64'), 
-                                                        name='input_noise',
-                                                        trainable=True,
-                                                        dtype='float64') 
-        self.output_noise = tf.Variable(initial_value = 1e-2,
-                                        name='output_noise',
-                                        trainable=True,
-                                        dtype='float64')
-        # Instantiate kernel and gp model
-        self.k = models.AngleMatern()
-        self.kmm = self.k(self.x_l)
-        
-    def call(self, y_l, X_d):
-        r"""
-        Produces an estimate x for the latent variable x = f(X) + noise
-        With that estimate x, projects to the output space m = Lx + var
-        where the loss is calculated as l = (y_d - mean)(y_d - mean)/var
-        outputs x, mean and var
-        """
-        
-        ## Linear Map
-        x = tf.math.multiply(X_d, self.w)
-        x = tf.math.reduce_sum(x, axis=1) + self.b
-        x = tf.reshape(x, (-1, 1))
-        
-        ## Gaussian Process
-        # Convert (lat, lon) to (x,y,z)
-        self.y_l = np.stack( (np.sin(np.deg2rad(90.0-y_l[:,1]))*np.cos(np.deg2rad(y_l[:,0]+180.0)),  
-                     np.sin(np.deg2rad(90.0-y_l[:,1]))*np.sin(np.deg2rad(y_l[:,0]+180.0)),
-                     np.cos(np.deg2rad(90.0-y_l[:,1]))), axis=-1)
-        self.y_l = tf.cast(self.y_l, dtype='float64')
-        self.output_dim = y_l.shape[0]
-        
-        knn = self.k(self.y_l)
-        kmn = self.k(self.x_l, self.y_l)
-        k_diag = tf.linalg.diag_part(self.kmm)
-        ks = tf.linalg.set_diag(self.kmm, k_diag + self.input_noise**2)
-        L = tf.linalg.cholesky(ks)
-        Lp = tf.linalg.matmul(kmn, 
-                              tf.linalg.cholesky_solve(L, 
-                                    tf.eye(self.input_dim, dtype='float64')), 
-                              transpose_a=True)
-        
-        
-        # Get mean, variance predictions
-        mean = tf.reshape(tf.linalg.matmul(Lp, x), (-1,))
-        var = (knn+tf.linalg.diag(tf.fill(tf.TensorShape(self.output_dim), self.output_noise))) - tf.linalg.matmul(Lp, kmn)
-        var += tf.matmul(tf.matmul(Lp, tf.linalg.diag(self.input_noise)), 
-                                   Lp, 
-                                   transpose_b=True)
-        var_d = tf.reshape(tf.linalg.diag_part(var), (-1, ))
-        
-        return (x, mean, var_d)
-    
-    def log_prob(self, y_pred, y_true, loss=False):
-        x, m, v = y_pred
-        # Priors for gp kernel hyperparameters
-        amplitude = tfd.LogNormal(loc=0.0, scale=np.float64(1.0))
-        amp_loss = -amplitude.log_prob(self.k.amplitude)
-        
-        length_scale = tfd.LogNormal(loc=0.0, scale=np.float64(1.0))
-        ls_loss = -length_scale.log_prob(self.k.length_scale)
-        
-        # Priors for input, output noise
-        input_noise = tfd.Independent(tfd.LogNormal(loc=tf.cast(tf.fill([self.input_dim], 0.0), dtype='float64'),
-                                    scale=tf.cast(tf.fill([self.input_dim], 1.0), dtype='float64')),
-                                     reinterpreted_batch_ndims=1)
-        input_noise_loss = -input_noise.log_prob(self.input_noise)
-
-        output_noise = tfd.LogNormal(loc=0.0, scale=np.float64(1.0))
-        output_noise_loss = -output_noise.log_prob(self.output_noise)
-        
-        # Gaussian Process Prior
-        k_diag = tf.linalg.diag_part(self.kmm)
-        ks = tf.linalg.set_diag(self.kmm, k_diag + self.input_noise)
-        L = tf.linalg.cholesky(ks)
-        gp = tfd.MultivariateNormalTriL(loc=tf.cast(tf.fill([self.input_dim], 0.0), dtype='float64'), scale_tril=L)
-        gp_loss = -gp.log_prob(tf.reshape(x, (-1,)))
-        
-        
-        # Likelihood
-        obs = tfd.Independent(tfd.Normal(loc=tf.cast(y_true.reshape(-1,), dtype='float64'), scale=v),
-                              reinterpreted_batch_ndims=1)
-        obs_loss = -obs.log_prob(mean)
-        
-
-        total_loss = amp_loss + ls_loss + input_noise_loss + output_noise_loss 
-        total_loss += gp_loss + obs_loss
-        if loss:
-            return total_loss
-        else:
-            return -total_loss
-    
-                    
-    def predict(self, X_d):
-        r"""
-        Produces an estimate x for the latent variable x = f(X)+noise
-        """
-        x = tf.math.multiply(X_d, self.w)
-        x = tf.math.reduce_sum(x, axis=1) + self.b
-        x = tf.reshape(x, (-1, 1))
-        return x
 
 
 ####################################################################################
