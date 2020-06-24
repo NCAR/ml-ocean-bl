@@ -30,6 +30,7 @@ import tensorflow as tf
 import tensorflow.keras as keras
 import gpflow as gpf
 import tensorflow_probability as tfp
+tf.keras.backend.set_floatx('float64')
 
 ####################################################################################
 ########################### Import Data ############################################
@@ -109,7 +110,7 @@ from gpflow.mean_functions import MeanFunction
 from gpflow.models.model import GPModel, InputData, MeanAndVariance, RegressionData
 from gpflow.models.training_mixins import InternalDataTrainingLossMixin
 tfd = tfp.distributions
-
+tfb = tfp.bijectors
 class AngleMatern(Kernel):
     r"""
     Implements a Matern kernel using the gpflow Kernel base class.
@@ -127,15 +128,19 @@ class AngleMatern(Kernel):
     
     def __init__(self):
         super().__init__()
-        self.amplitude = gpf.Parameter(10.0, transform=positive())
-        self.length_scale = gpf.Parameter(1.0, transform=positive())
+        self.amplitude = gpf.Parameter(5.0, transform=positive(), 
+                                      prior = tfd.LogNormal(loc=0.0, scale=np.float64(0.5))
+                                      )
+        self.length_scale = gpf.Parameter(10.0, transform=positive(),
+                                    prior = tfd.LogNormal(loc=0.0, scale=np.float64(0.5))
+                                         )
         
     def K(self, X, X2=None):
         if X2 is None:
             X2 = X
         dist = tf.linalg.matmul(X, X2, transpose_b=True)
         dist = tf.clip_by_value(dist, -1, 1) # Needed for numerical stability
-        dist = tf.math.acos(dist)
+        dist = 600*tf.math.acos(dist)
         return self.matern(dist)  # this returns a 2D tensor
 
     def K_diag(self, X):
@@ -143,9 +148,9 @@ class AngleMatern(Kernel):
         return tf.reshape(tf.linalg.diag_part(self.matern(dist)), (-1,)) # this returns a 1D tensor
     
     def matern(self, dist):
-        Kl = dist * tf.cast(tf.math.sqrt(3.0), dtype='float64')/self.length_scale
-        Kl = self.amplitude*(1. + Kl) * tf.exp(-Kl)
-        return Kl
+        z = np.float64(np.sqrt(5)) * dist / self.length_scale
+        z = (np.float64(1.0) + z + (z ** 2) / 3) * tf.math.exp(-z)
+        return z
     
 
 class noisyGPR(GPModel, InternalDataTrainingLossMixin):
@@ -232,7 +237,14 @@ class noisyGPR(GPModel, InternalDataTrainingLossMixin):
         f_mean_zero, f_var = conditional(
             kmn, kmm + s, knn, err, full_cov=full_cov, white=False
         )  # [N, P], [N, P] or [P, N, N]
+        
+        
+        L = tf.linalg.cholesky(kmm+s)
+        Y_var = tf.linalg.diag_part(
+            tf.matmul(tf.matmul(kmn, tf.linalg.cholesky_solve(L, tf.linalg.diag(Y_noise)), transpose_a=True),
+                          kmn))
         f_mean = f_mean_zero + self.mean_function(Xnew)
+        f_var += tf.reshape(Y_var, (-1,1))
         return f_mean, f_var
     
     
@@ -292,14 +304,13 @@ class Linear(keras.Model):
                             name = 'bias')
         
         # estimate of input noise
-        self.input_noise = gpf.Parameter(1e-6*tf.ones([input_dim,]), transform=positive(), 
-                                                                    prior = tfd.HalfCauchy(loc=0, scale=2))
+        self.input_noise = tf.Variable(tf.ones([input_dim,], dtype='float64'),
+                                      trainable=True, name='input_noise')
         
         # Instantiate kernel and gp model
         self.k = AngleMatern()
         self.m = noisyGPR(data=(self.x_l, self.x_l[:,0], self.x_l[:,0]), kernel=self.k, mean_function=None)
-        
-        
+        self.m.likelihood.variance.prior = tfd.LogNormal(loc=0.0, scale=np.float64(1.0))
     def call(self, y_l, X_d):
         r"""
         Produces an estimate x for the latent variable x = f(X) + noise
@@ -307,12 +318,14 @@ class Linear(keras.Model):
         where the loss is calculated as l = (y_d - mean)(y_d - mean)/var
         outputs x, mean and var
         """
+        self.softplus = tfb.Softplus()
+        input_noise = tf.cast(self.softplus.forward(self.input_noise), dtype='float64')
         
         ## Linear Map
         x = tf.math.multiply(X_d, self.w)
         x = tf.math.reduce_sum(x, axis=1) + self.b
         x = tf.reshape(x, (-1, 1))
-        self.m.data = (self.x_l, x, self.input_noise)
+        self.m.data = (self.x_l, x, input_noise)
         
         ## Gaussian Process
         # Convert (lat, lon) to (x,y,z)
@@ -322,34 +335,17 @@ class Linear(keras.Model):
         self.y_l = tf.cast(self.y_l, dtype='float64')
         
         # Get mean, variance predictions
+        
         mean, var = self.m.predict_f(self.y_l)
         return x, tf.reshape(mean, (-1,)), tf.reshape(var, (-1,))
     
-    def log_prob(self, y_pred, y_true, loss=False):
+    def log_prob(self, y_pred, y_true):
         x, m, v = y_pred
-        
-        # Priors for input noise
-        input_noise = tfd.Independent(tfd.HalfCauchy(loc=tf.cast(tf.fill([self.input_dim], 0.0), dtype='float64'),
-                                    scale=tf.cast(tf.fill([self.input_dim], 1.0), dtype='float64')),
-                                     reinterpreted_batch_ndims=1)
-        input_noise_loss = -input_noise.log_prob(self.input_noise)
-
-        
-        gp_loss = -self.m.log_marginal_likelihood()
-        
-        
-        # Likelihood
-        obs = tfd.Independent(tfd.Normal(loc=tf.cast(y_true.reshape(-1,), dtype='float64'), scale=v),
-                              reinterpreted_batch_ndims=1)
-        obs_loss = -obs.log_prob(m)
-        
-
-        total_loss = 0.0
-        total_loss += gp_loss + obs_loss
-        if loss:
-            return total_loss
-        else:
-            return -total_loss
+        loss = tf.math.reduce_mean((y_true-m)**2/v)
+        loss += tf.math.reduce_mean(tf.math.log(v))
+        loss += tf.math.reduce_mean(x**2/self.input_noise)
+        loss += tf.math.reduce_mean(tf.math.log(self.input_noise))
+        return loss
     
     def predict(self, X_d):
         r"""
@@ -360,17 +356,232 @@ class Linear(keras.Model):
         x = tf.reshape(x, (-1, 1))
         return x
     
+class DenseLinear(keras.Model):
+    r"""
+    Implements linear model x = LX + b + noise, where X = np.vstack(X[0], X[1], ...)
+    with training model y = Lx + V, where L and V are obtained via GP regression.
+    Input noise is estimated along with parameters w and b.
+    
+    Input arguments - input_dim, number of rows of X
+                    - n_features, number of columns of X
+                    - x_l,  locations of inputs, shape (input_dim, 2)
+                            columns house (lon,lat) coordinates respectively.
+                    - y_l, locations of training data
+                    - y_d, training data values
+                            
+    Output arguments - x, estimate of x = f(X) + noise
+                     - m, mean estimate of m = Lx + V
+                     - v, diagonal variance of gp covariance V
+                     
+    Parameters       - w, linear weight matrix, shape (input_dim, n_features)
+                     - b, bias, shape (input_dim, )
+                     - input_noise, input-dependent noise estimate, shape (input_dim,)
+                         gives estimate of variances along with Linear.m.likelihood.variance
+    
+    Inherited Parameters - .m.likelihood.variance, constant variance estimate
+                         - .k.amplitude, kernel amplitude
+                         - .k.length_Scale, kernel length scale, 1 / correlation distance
+    
+    
+    """
+    def __init__(self, input_dim, n_features, x_l, dtype='float64', **kwargs):
+        super(DenseLinear, self).__init__(name='dense_linear_projection', dtype='float64', **kwargs)
+        
+        # Sizes
+        self.input_dim = input_dim
+        self.n_features = n_features
+        
+        # Convet lat lon to (x,y,z) for kernel use.        
+        self.x_l = np.stack( (np.sin(np.deg2rad(90.0-x_l[:,1]))*np.cos(np.deg2rad(x_l[:,0]+180.0)),  
+                     np.sin(np.deg2rad(90.0-x_l[:,1]))*np.sin(np.deg2rad(x_l[:,0]+180.0)),
+                     np.cos(np.deg2rad(90.0-x_l[:,1]))), axis=-1)
+        self.x_l = tf.cast(self.x_l, dtype='float64')
+        
+        
+        # Parameters, w, b, input_noise
+        # Linear weights
+        self.L = tf.keras.layers.Dense(self.input_dim, 
+                                       input_shape=(self.n_features*self.input_dim,)
+                                      )
+        
+        # estimate of input noise
+        self.input_noise = tf.Variable(tf.ones([input_dim,], dtype='float64'),
+                                      trainable=True, name='input_noise')
+        
+        # Instantiate kernel and gp model
+        self.k = AngleMatern()
+        self.m = noisyGPR(data=(self.x_l, self.x_l[:,0], self.x_l[:,0]), kernel=self.k, mean_function=None)
+        self.m.likelihood.variance.prior = tfd.LogNormal(loc=0.0, scale=np.float64(1.0))
+    def call(self, y_l, X_d):
+        r"""
+        Produces an estimate x for the latent variable x = f(X) + noise
+        With that estimate x, projects to the output space m = Lx + var
+        where the loss is calculated as l = (y_d - mean)(y_d - mean)/var
+        outputs x, mean and var
+        """
+        self.softplus = tfb.Softplus()
+        input_noise = tf.cast(self.softplus.forward(self.input_noise), dtype='float64')
+        
+        ## Linear Map
+        x = self.L(tf.cast(X_d.reshape(1,-1), dtype='float64'))
+        x = tf.reshape(x, (-1, 1))
+        self.m.data = (self.x_l, x, input_noise)
+        
+        ## Gaussian Process
+        # Convert (lat, lon) to (x,y,z)
+        self.y_l = np.stack( (np.sin(np.deg2rad(90.0-y_l[:,1]))*np.cos(np.deg2rad(y_l[:,0]+180.0)),  
+                     np.sin(np.deg2rad(90.0-y_l[:,1]))*np.sin(np.deg2rad(y_l[:,0]+180.0)),
+                     np.cos(np.deg2rad(90.0-y_l[:,1]))), axis=-1)
+        self.y_l = tf.cast(self.y_l, dtype='float64')
+        
+        # Get mean, variance predictions
+        
+        mean, var = self.m.predict_f(self.y_l)
+        return x, tf.reshape(mean, (-1,)), tf.reshape(var, (-1,))
+    
+    def log_prob(self, y_pred, y_true):
+        x, m, v = y_pred
+        loss = tf.math.reduce_mean((y_true-m)**2/v)
+        loss += tf.math.reduce_mean(tf.math.log(v))
+        loss += tf.math.reduce_mean(x**2/self.input_noise)
+        loss += tf.math.reduce_mean(tf.math.log(self.input_noise))
+        return loss
+    
+    def predict(self, X_d):
+        r"""
+        Produces an estimate x for the latent variable x = f(X)+noise
+        """
+       ## Linear Map
+        x = self.L(tf.cast(X_d.reshape(1,-1), dtype='float64'))
+        x = tf.reshape(x, (-1, 1))
+        return x
+    
+class ANN(keras.Model):
+    r"""
+    Implements an artificial neural network for the relationship x = f(X) + b + noise, 
+    where X = np.vstack(X[0], X[1], ...) with training model y = Lx + V, where L and V 
+    are obtained via GP regression.
+    
+    Input arguments - input_dim, number of rows of X
+                    - n_features, number of columns of X
+                    - x_l,  locations of inputs, shape (input_dim, 2)
+                            columns house (lon,lat) coordinates respectively.
+                    - y_l, locations of training data
+                    - y_d, training data values
+                            
+    Output arguments - x, estimate of x = f(X) + noise
+                     - m, mean estimate of m = Lx + V
+                     - v, diagonal variance of gp covariance V
+                     
+    Parameters       - w_i, linear weight matrix, shape (input_dim, n_features)
+                     - b_i, bias, shape (input_dim, )
+                     - input_noise, input-dependent noise estimate, shape (input_dim,)
+                         gives estimate of variances along with Linear.m.likelihood.variance
+    
+    Inherited Parameters - .m.likelihood.variance, constant variance estimate
+                         - .k.amplitude, kernel amplitude
+                         - .k.length_Scale, kernel length scale, 1 / correlation distance
+    
+    
+    """
+    def __init__(self, input_dim, n_features, x_l, dtype='float64', **kwargs):
+        super(ANN, self).__init__(name='neural_network', dtype='float64', **kwargs)
+        
+        # Sizes
+        self.input_dim = input_dim
+        self.n_features = n_features
+        
+        # Convet lat lon to (x,y,z) for kernel use.        
+        self.x_l = np.stack( (np.sin(np.deg2rad(90.0-x_l[:,1]))*np.cos(np.deg2rad(x_l[:,0]+180.0)),  
+                     np.sin(np.deg2rad(90.0-x_l[:,1]))*np.sin(np.deg2rad(x_l[:,0]+180.0)),
+                     np.cos(np.deg2rad(90.0-x_l[:,1]))), axis=-1)
+        self.x_l = tf.cast(self.x_l, dtype='float64')
+        
+        
+        # Parameters, w, b, input_noise
+        # Linear weights
+        self.L = tf.keras.Sequential()
+        self.L.add(
+            tf.keras.layers.Dense(
+                self.input_dim, 
+                input_shape=(self.n_features*self.input_dim,),
+                activation='relu',)
+        )
+        self.L.add(
+            tf.keras.layers.Dense(
+                self.input_dim, 
+                input_shape=(self.input_dim,),
+                activation='relu',)
+        )
+        self.L.add(
+            tf.keras.layers.Dense(
+                self.input_dim, 
+                input_shape=(self.input_dim,),
+                )
+        )
+        
+        
+        # estimate of input noise
+        self.input_noise = tf.Variable(tf.ones([input_dim,], dtype='float64'),
+                                      trainable=True, name='input_noise')
+        
+        # Instantiate kernel and gp model
+        self.k = AngleMatern()
+        self.m = noisyGPR(data=(self.x_l, self.x_l[:,0], self.x_l[:,0]), kernel=self.k, mean_function=None)
+        self.m.likelihood.variance.prior = tfd.LogNormal(loc=0.0, scale=np.float64(1.0))
+    def call(self, y_l, X_d):
+        r"""
+        Produces an estimate x for the latent variable x = f(X) + noise
+        With that estimate x, projects to the output space m = Lx + var
+        where the loss is calculated as l = (y_d - mean)(y_d - mean)/var
+        outputs x, mean and var
+        """
+        self.softplus = tfb.Softplus()
+        input_noise = tf.cast(self.softplus.forward(self.input_noise), dtype='float64')
+        
+        ## Linear Map
+        x = self.L(tf.cast(X_d.reshape(1,-1), dtype='float64'))
+        x = tf.reshape(x, (-1, 1))
+        self.m.data = (self.x_l, x, input_noise)
+        
+        ## Gaussian Process
+        # Convert (lat, lon) to (x,y,z)
+        self.y_l = np.stack( (np.sin(np.deg2rad(90.0-y_l[:,1]))*np.cos(np.deg2rad(y_l[:,0]+180.0)),  
+                     np.sin(np.deg2rad(90.0-y_l[:,1]))*np.sin(np.deg2rad(y_l[:,0]+180.0)),
+                     np.cos(np.deg2rad(90.0-y_l[:,1]))), axis=-1)
+        self.y_l = tf.cast(self.y_l, dtype='float64')
+        
+        # Get mean, variance predictions
+        
+        mean, var = self.m.predict_f(self.y_l)
+        return x, tf.reshape(mean, (-1,)), tf.reshape(var, (-1,))
+    
+    def log_prob(self, y_pred, y_true):
+        x, m, v = y_pred
+        loss = tf.math.reduce_mean((y_true-m)**2/v)
+        loss += tf.math.reduce_mean(tf.math.log(v))
+        loss += tf.math.reduce_mean(x**2/self.input_noise)
+        loss += tf.math.reduce_mean(tf.math.log(self.input_noise))
+        return loss
+    
+    def predict(self, X_d):
+        r"""
+        Produces an estimate x for the latent variable x = f(X)+noise
+        """
+        x = self.L(tf.cast(X_d.reshape(1,-1), dtype='float64'))
+        x = tf.reshape(x, (-1, 1))
+        return x
+    
 
 
 ####################################################################################
 ########################### Training Proceedure ####################################
 ####################################################################################
-
+from scipy.stats import pearsonr
 def train_func(dataset, model, epochs = 500, print_epoch = 100, lr = 0.001, num_early_stopping = 500):
     optimizer = tf.keras.optimizers.Adam(learning_rate=lr)
-    losses = np.zeros((epochs,4))
-    amplitude = np.zeros(epochs)
-    length_scale = np.zeros(epochs)
+    losses = np.zeros((epochs,6))
+    variables = np.zeros((epochs,7))
     
     n_steps_train = dataset.i_train.size
     n_steps_test = dataset.i_test.size
@@ -378,52 +589,75 @@ def train_func(dataset, model, epochs = 500, print_epoch = 100, lr = 0.001, num_
     # Implement early_stopping
     early_stopping_counter = 0
     early_stopping_min_value = 1e6
+    mini_batch_size = 10
     # Iterate over epochs.
     for epoch in range(epochs):
-        
+        loss = 0
         batch = np.random.permutation(n_steps_train)
-        for steps in range(n_steps_train):
-            X_d, X_l, y_d, y_l = dataset.get_index(dataset.i_train[batch[steps]])
-            loss = 0
-            
-            with tf.GradientTape(persistent=True) as tape:
+        for steps in range(1, n_steps_train+1):
+            X_d, X_l, y_d, y_l = dataset.get_index(dataset.i_train[batch[steps-1]])
+            x, m, v = model(
+                  y_l.reshape(-1,2), 
+                  X_d.reshape(-1,3))
+            opt = gpf.optimizers.Scipy()
+            opt_logs = opt.minimize(model.m.training_loss, 
+                                    model.m.trainable_variables, 
+                                    options=dict(maxiter=10))
+            with tf.GradientTape() as dtape:
                 x, m, v = model(
                     y_l.reshape(-1,2), 
-                    X_d.reshape(-1,3), 
-                    y_d.reshape(-1,1))
-                
-                # Compute reconstruction loss
-                loss += sum(model.losses)  # Add KLD regularization loss
+                    X_d.reshape(-1,3))
+                loss += model.log_prob((x, m, v), y_d) 
             
-            # Apply gradients to model parameters
-            grads = tape.gradient(loss, model.trainable_weights)
-            grads1 = tape.gradient(loss, model.m.trainable_variables)
-            optimizer.apply_gradients(zip(grads, model.trainable_variables))
-            
-            # Apply gradients to gp parameters
-            optimizer.apply_gradients(zip(grads1, model.m.trainable_variables))
-            del tape
-            
-            losses[epoch, 0] += tf.math.reduce_mean( (y_d-m)*(y_d-m)/v)/n_steps_train
-
-            
+            losses[epoch, 0] += tf.math.reduce_mean( (y_d-m)*(y_d-m))/n_steps_train
             losses[epoch, 1] += np.mean( (y_d < (m+np.sqrt(v) )) & 
                                           (y_d > (m-np.sqrt(v) )) )/n_steps_train
+            losses[epoch, 2] += pearsonr(m.numpy().flatten(), y_d.flatten())[0]/n_steps_train
+            variables[epoch, 0] += model.k.amplitude.numpy()/n_steps_train
+            variables[epoch, 1] += model.k.length_scale.numpy()/n_steps_train
+            variables[epoch, 2] += model.m.likelihood.variance.numpy()/n_steps_train
+            variables[epoch, 3] += np.linalg.norm(model.input_noise.numpy())/np.sqrt(model.input_dim)
+            variables[epoch, 4] += np.linalg.norm(v.numpy())/n_steps_train/np.sqrt(model.input_dim)
+            variables[epoch, 5] += np.linalg.norm(m.numpy())/n_steps_train/np.sqrt(model.input_dim)
+            variables[epoch, 6] += np.linalg.norm(x.numpy())/n_steps_train/np.sqrt(model.input_dim)
+
+            if steps % mini_batch_size == 0:
+                # Apply gradients to model parameters
+                grads = dtape.gradient(loss, model.trainable_variables)
+                optimizer.apply_gradients(zip(grads, model.trainable_variables))
+                loss = 0
+            
+
+        
+        
+ 
+        
+        
         for steps in range(n_steps_test):
             X_d, X_l, y_d, y_l = dataset.get_index(dataset.i_test[steps])
-            x, m, v = model(y_l, X_d, y_d)
-            
-                            
-            losses[epoch, 2] += tf.math.reduce_mean( (y_d-m)*(y_d-m)/v)/n_steps_test
-            losses[epoch, 3] += np.mean( (y_d < (m+np.sqrt(v) )) & 
-                                          (y_d > (m-np.sqrt(v) )) )/n_steps_test 
+            x, m, v = model(
+                  y_l.reshape(-1,2), 
+                  X_d.reshape(-1,3))
+            opt = gpf.optimizers.Scipy()
+            opt_logs = opt.minimize(model.m.training_loss, 
+                                    model.m.trainable_variables, 
+                                    options=dict(maxiter=10))
+            x, m, v = model(y_l, X_d)
+            losses[epoch, 3] += tf.math.reduce_mean( (y_d-m)*(y_d-m))/n_steps_test
+            losses[epoch, 4] += np.mean( (y_d < (m+np.sqrt(v) )) & 
+                                          (y_d > (m-np.sqrt(v) )) )/n_steps_test
+            losses[epoch, 5] += pearsonr(m.numpy().flatten(), y_d.flatten())[0] / n_steps_test
 
 
         if epoch % print_epoch == 0:
             print('Epoch', epoch,  ' ', 'mean train loss = {:2.3f}'.format(losses[epoch,0]),
-                                        'Train Prob = {:.2f}'.format(losses[epoch,1]),
-                                        'mean test loss = {:2.3f}'.format(losses[epoch, 2]), 
-                                        'Test Prob = {:.2f}'.format(losses[epoch,3]))
+                                        'train Prob = {:.2f}'.format(losses[epoch,1]),
+                                        'train correlation = {:.2f}'.format(losses[epoch,2]),
+                                        '\n \t',
+                                        'mean test loss = {:2.3f}'.format(losses[epoch, 3]), 
+                                        'test Prob = {:.2f}'.format(losses[epoch,4]),
+                                         'test correlation = {:.2f}'.format(losses[epoch,5]),
+                 )
         
         if losses[epoch,0] < early_stopping_min_value:
             early_stopping_min_value = losses[epoch, 0]
@@ -433,7 +667,7 @@ def train_func(dataset, model, epochs = 500, print_epoch = 100, lr = 0.001, num_
         if early_stopping_counter > num_early_stopping:
             print('Early Stopping at iteration {:d}'.format(epoch))
             break
-    return losses[:epoch, :]
+    return losses[:epoch, :], variables[:epoch, :]
 
 ####################################################################################
 ########################### Plotting functions #####################################
