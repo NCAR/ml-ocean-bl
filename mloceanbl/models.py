@@ -495,7 +495,7 @@ def train_func(dataset, model, epochs = 500, print_epoch = 100, lr = 0.001, num_
         for steps in range(1, n_steps_train+1):
             X_d, X_l, y_d, y_l = dataset.get_index(dataset.i_train[batch[steps-1]])
             with tf.GradientTape() as dtape:
-                dtape.watch(model.trainable_variables[3:])
+                dtape.watch(model.trainable_variables[-2:])
                 x = model(X_d.reshape(-1,3))
                 loss += model.log_prob(x, y_l.reshape(-1,2), y_d) 
 
@@ -514,8 +514,8 @@ def train_func(dataset, model, epochs = 500, print_epoch = 100, lr = 0.001, num_
 
             if steps % mini_batch_size == 0:
                 # Apply gradients to model parameters
-                grads = dtape.gradient(loss, model.trainable_variables[3:])
-                optimizer.apply_gradients(zip(grads, model.trainable_variables[3:]))
+                grads = dtape.gradient(loss, model.trainable_variables[-2:])
+                optimizer.apply_gradients(zip(grads, model.trainable_variables[-2:]))
                 loss = 0
 
         
