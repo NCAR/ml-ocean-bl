@@ -141,8 +141,8 @@ class GPR(keras.Model):
 
         noise_v = tf.linalg.matmul(Kxy,
             tf.linalg.cholesky_solve(L, 
-            tf.linalg.diag(tf.math.sqrt(tf.math.log(1+tf.math.exp(self.input_noise)))),
-            transpose_a = True))
+            tf.linalg.diag(tf.math.sqrt(tf.math.log(1+tf.math.exp(self.input_noise))))),
+            transpose_a = True)
         noise_v = tf.linalg.matmul(noise_v, noise_v, transpose_b = True)
         
         return m, tf.linalg.diag_part(v+noise_v)
@@ -339,7 +339,9 @@ class DenseLinear(keras.Model):
         # Parameters, w, b, input_noise
         # Linear weights
         self.L = tf.keras.layers.Dense(self.input_dim, 
-                                       input_shape=(self.n_features*self.input_dim,)
+                                       input_shape=(self.n_features*self.input_dim,),
+                                       kernel_regularizer = tf.keras.regularizers.l1(1e-2),
+                                       bias_regularizer = tf.keras.regularizers.l1(1e-2)
                                       )
         
     def call(self, x):
@@ -351,7 +353,7 @@ class DenseLinear(keras.Model):
         """
 
         ## Linear Map
-        x = self.L(tf.cast(x.reshape(1,-1), dtype='float64'))
+        x = self.L(tf.cast(tf.reshape(x, [1,-1]), dtype='float64'))
         x = tf.reshape(x, (-1, 1))
         
         return x
@@ -361,7 +363,7 @@ class DenseLinear(keras.Model):
         self.m, self.v = self.gp(y_pred, y_l)
         loss = tf.math.reduce_mean((y_true-self.m)**2/self.v)
         loss += tf.math.reduce_mean(tf.math.log(self.v))
-
+        loss += tf.math.reduce_sum(self.L.losses)
         return loss
     
     
@@ -387,9 +389,7 @@ class DenseLinear(keras.Model):
         dJdb = -dJdb_temp
         dJdL = -tf.transpose(tf.linalg.matmul(dJdb_temp, X_d.reshape(-1,1), transpose_b = True))
         return dJdL, tf.reshape(dJdb, [self.input_dim,])
-    
-    
-    
+       
 class ANN(keras.Model):
     r"""
     Implements an artificial neural network for the relationship x = f(X) + b + noise, 
@@ -452,7 +452,7 @@ class ANN(keras.Model):
         )
         
         
-    def call(self, y_l, X_d):
+    def call(self, X_d):
         r"""
         Produces an estimate x for the latent variable x = f(X) + noise
         With that estimate x, projects to the output space m = Lx + var
@@ -461,7 +461,7 @@ class ANN(keras.Model):
         """
         
         ## ANN Map
-        x = self.L(tf.cast(X_d.reshape(1,-1), dtype='float64'))
+        x = self.L(tf.cast(tf.reshape(X_d, [1,-1]), dtype='float64'))
         x = tf.reshape(x, (-1, 1))
         return x
     
@@ -471,6 +471,449 @@ class ANN(keras.Model):
         loss += tf.math.reduce_mean(tf.math.log(self.v))
         return loss
     
+class CNN(keras.Model):
+    r"""
+    Implements a convolutional neural network for the relationship x = f(X) + b + noise, 
+    where X = (nlat, nlon, n_channels) with training model y = Lx + V, where L and V 
+    are obtained via GP regression.
+    
+    Input arguments - nlon, number of rows (longitude) of X
+                    - nlat, number of columns (latitude) of X
+                    - n_channels, number of columns of X
+                    - x_l,  locations of inputs, shape (input_dim, 2)
+                            columns house (lon,lat) coordinates respectively.
+                    - y_l, locations of training data
+                    - y_d, training data values
+                            
+    Output arguments - x, estimate of x = f(X) + noise
+                     - m, mean estimate of m = Lx + V
+                     - v, diagonal variance of gp covariance V
+                     
+    Parameters       - w_i, linear weight matrix, shape (input_dim, n_features)
+                     - b_i, bias, shape (input_dim, )
+    
+    Inherited Parameters - input_noise, input-dependent noise estimate, shape (input_dim,)
+                         gives estimate of variances 
+                         - .gp.amplitude, kernel amplitude
+                         - .gp.length_Scale, kernel length scale
+    
+    
+    """
+    def __init__(self, nlat, nlon, n_channels, x_l, dtype='float64', **kwargs):
+        super(CNN, self).__init__(name='convolutional_neural_network', dtype='float64', **kwargs)
+        
+        # Sizes
+        self.nlat = nlat
+        self.nlon = nlon
+        self.n_channels = n_channels
+        
+        # Initialize grid and gaussian process        
+        self.x_l = x_l
+        self.gp = GPR(x_l)
+        
+        
+        # Parameters, w, b, input_noise
+        # Linear weights
+        num_filters = 40
+        self.L = tf.keras.Sequential(
+            [
+                tf.keras.layers.InputLayer(input_shape = (self.nlat, self.nlon, self.n_channels)),
+                tf.keras.layers.Conv2D(num_filters, (3, 3), activation='relu',),
+                tf.keras.layers.Conv2D(num_filters, (3, 3), activation='relu',),
+                tf.keras.layers.MaxPooling2D((2,2)),
+                tf.keras.layers.Conv2D(2*num_filters, (3, 3), activation='relu',),
+                tf.keras.layers.Conv2D(2*num_filters, (3, 3), activation='relu',),
+                tf.keras.layers.MaxPooling2D((2,2)),
+                tf.keras.layers.Conv2D(4*num_filters, (3, 3), activation='relu',),
+                tf.keras.layers.Conv2D(4*num_filters, (3, 3), activation='relu',),
+                tf.keras.layers.MaxPooling2D((2,2)),
+                tf.keras.layers.Flatten(),
+                tf.keras.layers.Dense(self.nlat*self.nlon, activation = 'relu',
+                    kernel_regularizer = tf.keras.regularizers.l2(1e-3),
+                     ),
+                tf.keras.layers.Dense(self.nlat*self.nlon,
+                    kernel_regularizer = tf.keras.regularizers.l2(1e-3),
+                     ),
+            ]
+        )
+ 
+
+                
+    def call(self, X_d):
+        r"""
+        Produces an estimate x for the latent variable x = f(X) + noise
+        With that estimate x, projects to the output space m = Lx + var
+        where the loss is calculated as l = (y_d - mean)(y_d - mean)/var
+        outputs x, mean and var
+        """
+        
+        ## ANN Map
+        x = self.L(tf.cast(tf.reshape(X_d, [1, self.nlat, self.nlon, self.n_channels]), dtype='float64'))
+        x = tf.reshape(x, (-1, 1))
+        return x
+    
+    def log_prob(self, y_pred, y_l, y_true):
+        self.m, self.v = self.gp(y_pred, y_l)
+        loss = tf.math.reduce_mean((y_true-self.m)**2/self.v)
+        loss += tf.reduce_sum(self.L.losses)
+        loss += tf.math.reduce_mean(tf.math.log(self.v))
+        return loss
+
+class VAE(keras.Model):
+    r"""
+    Implements a variational autoencoder for the relationship x = f(X) + b + noise, 
+    where X = np.vstack(X[0], X[1], ...) with training model y = Lx + V, where L and V 
+    are obtained via GP regression.
+    
+    Input arguments - input_dim, number of rows of X
+                    - n_features, number of columns of X
+                    - x_l,  locations of inputs, shape (input_dim, 2)
+                            columns house (lon,lat) coordinates respectively.
+                    - y_l, locations of training data
+                    - y_d, training data values
+                            
+    Output arguments - x, estimate of x = f(X) + noise
+                     - m, mean estimate of m = Lx + V
+                     - v, diagonal variance of gp covariance V
+                     
+    Parameters       - w_i, linear weight matrix, shape (input_dim, n_features)
+                     - b_i, bias, shape (input_dim, )
+    
+    Inherited Parameters - input_noise, input-dependent noise estimate, shape (input_dim,)
+                         gives estimate of variances 
+                         - .gp.amplitude, kernel amplitude
+                         - .gp.length_Scale, kernel length scale
+    
+    
+    """
+    def __init__(self, input_dim, n_features, x_l, latent_dim = 20, dtype='float64', **kwargs):
+        super(VAE, self).__init__(name='variational_autoencoder', dtype='float64', **kwargs)
+        
+        # Sizes
+        self.input_dim = input_dim
+        self.n_features = n_features
+        self.latent_dim = latent_dim
+        
+        # Initialize grid and gaussian process        
+        self.x_l = x_l
+        self.gp = GPR(x_l)
+        
+        
+        # Parameters, w, b, input_noise
+        # Linear weights
+        self.encoder = tf.keras.Sequential()
+        self.encoder.add(
+            tf.keras.layers.Dense(
+                self.input_dim, 
+                input_shape=(self.n_features*self.input_dim,),
+                activation='relu',)
+        )
+        self.encoder.add(
+            tf.keras.layers.Dense(
+                self.input_dim, 
+                activation='relu',)
+        )
+        self.encoder.add(
+            tf.keras.layers.Dense(
+                self.latent_dim + self.latent_dim, 
+                )
+        )
+
+        self.decoder = tf.keras.Sequential()
+        self.decoder.add(
+            tf.keras.layers.Dense(
+                self.input_dim, 
+                input_shape=(self.latent_dim,),
+                activation='relu',)
+        )
+        self.decoder.add(
+            tf.keras.layers.Dense(
+                self.input_dim, 
+                input_shape=(self.input_dim,),
+                activation='relu',)
+        )
+        self.decoder.add(
+            tf.keras.layers.Dense(
+                self.input_dim, 
+                input_shape=(self.input_dim,),
+                )
+        )
+ 
+
+    @tf.function
+    def sample(self, eps=None):
+        if eps is None:
+            eps = tf.random.normal(shape=(100, self.latent_dim))
+        return self.decode(eps)
+    
+    def encode(self, x):
+        mean, logvar = tf.split(self.encoder(x), num_or_size_splits=2, axis=1)
+        return mean, logvar
+    
+    def reparameterize(self, mean, logvar):
+        eps = tf.random.normal(shape = mean.shape, dtype='float64')
+        return eps * tf.exp(logvar*0.5) + mean
+    
+    def decode(self, z):
+        x = self.decoder(z)
+        return x
+
+        
+    def call(self, X_d):
+        r"""
+        Produces an estimate x for the latent variable x = f(X) + noise
+        With that estimate x, projects to the output space m = Lx + var
+        where the loss is calculated as l = (y_d - mean)(y_d - mean)/var
+        outputs x, mean and var
+        """
+        
+        ## ANN Map
+        self.mean, self.logvar = self.encode(tf.cast(tf.reshape(X_d, [1,-1]), dtype='float64'))
+        self.z = self.reparameterize(self.mean, self.logvar)
+        x = self.decode(self.z)
+        x = tf.reshape(x, (-1,1))
+        return x
+    
+    def log_prob(self, y_pred, y_l, y_true):
+        self.m, self.v = self.gp(y_pred, y_l)
+        loss = tf.math.reduce_mean((y_true-self.m)**2/self.v)
+        loss += tf.math.reduce_mean(tf.math.log(self.v))
+        loss += tf.math.reduce_mean( self.z**2 )
+        loss -= tf.math.reduce_mean( (self.z - self.mean)**2*tf.exp(-self.logvar) + self.logvar )
+        return loss
+
+class CVAE(keras.Model):
+    r"""
+    Implements a convolutional variational autoencoder for the relationship x = f(X) + b + noise, 
+    where X = np.vstack(X[0], X[1], ...) with training model y = Lx + V, where L and V 
+    are obtained via GP regression.
+    
+    Input arguments - input_dim, number of rows of X
+                    - n_features, number of columns of X
+                    - x_l,  locations of inputs, shape (input_dim, 2)
+                            columns house (lon,lat) coordinates respectively.
+                    - y_l, locations of training data
+                    - y_d, training data values
+                            
+    Output arguments - x, estimate of x = f(X) + noise
+                     - m, mean estimate of m = Lx + V
+                     - v, diagonal variance of gp covariance V
+                     
+    Parameters       - w_i, linear weight matrix, shape (input_dim, n_features)
+                     - b_i, bias, shape (input_dim, )
+    
+    Inherited Parameters - input_noise, input-dependent noise estimate, shape (input_dim,)
+                         gives estimate of variances 
+                         - .gp.amplitude, kernel amplitude
+                         - .gp.length_Scale, kernel length scale
+    
+    
+    """
+    def __init__(self, nlat, nlon, n_channels, x_l, latent_dim = 20, dtype='float64', **kwargs):
+        super(CVAE, self).__init__(name='convolutional_variational_autoencoder', dtype='float64', **kwargs)
+        
+        # Sizes
+        self.nlat = nlat
+        self.nlon = nlon
+        self.n_channels = n_channels
+        self.latent_dim = latent_dim
+
+        # Initialize grid and gaussian process        
+        self.x_l = x_l
+        self.gp = GPR(x_l)
+        
+        
+        # Parameters, w, b, input_noise
+        # Linear weights
+        self.encoder = tf.keras.Sequential(
+            [
+                tf.keras.layers.InputLayer(input_shape=(self.nlat, self.nlon, self.n_channels)),
+                tf.keras.layers.Conv2D(filters = self.nlat, kernel_size = 3, strides = (2,2), activation='relu'),
+                tf.keras.layers.Conv2D(filters = 2*self.nlat, kernel_size = 3, strides = (2,2), activation='relu'),
+                tf.keras.layers.Flatten(),
+                tf.keras.layers.Dense(self.latent_dim + self.latent_dim),
+            ]
+        )
+        self.decoder = tf.keras.Sequential(
+            [
+                tf.keras.layers.InputLayer(input_shape=(self.latent_dim,)),
+                tf.keras.layers.Dense(units = self.nlat, activation='relu'),
+                tf.keras.layers.Dense(units = self.nlat*self.nlon, activation='relu'),
+                tf.keras.layers.Dense(units = self.nlat*self.nlon)
+            ]
+        )
+        # self.decoder = tf.keras.Sequential(
+        #     [
+        #         tf.keras.layers.InputLayer(input_shape=(self.latent_dim,)),
+        #         tf.keras.layers.Dense(units = 10*10*self.nlat),
+        #         tf.keras.layers.Reshape(target_shape=(10, 10, self.nlat)),
+        #         tf.keras.layers.Conv2DTranspose(filters = 2*self.nlat, kernel_size = 3, strides = 2, padding='same', activation='relu'),
+        #         tf.keras.layers.Conv2DTranspose(filters = self.nlat, kernel_size = 3, strides = 2, padding='same', activation='relu'),
+        #         tf.keras.layers.Conv2DTranspose(filters = 1, kernel_size = 3, strides = 1, padding='same'),
+        #     ]
+        # )
+ 
+
+    @tf.function
+    def sample(self, eps=None):
+        if eps is None:
+            eps = tf.random.normal(shape=(100, self.latent_dim))
+        return self.decode(eps)
+    
+    def encode(self, x):
+        mean, logvar = tf.split(self.encoder(x), num_or_size_splits=2, axis=1)
+        return mean, logvar
+    
+    def reparameterize(self, mean, logvar):
+        eps = tf.random.normal(shape = mean.shape, dtype='float64')
+        return eps * tf.exp(logvar*0.5) + mean
+    
+    def decode(self, z):
+        x = self.decoder(z)
+        return x
+
+        
+    def call(self, X_d):
+        r"""
+        Produces an estimate x for the latent variable x = f(X) + noise
+        With that estimate x, projects to the output space m = Lx + var
+        where the loss is calculated as l = (y_d - mean)(y_d - mean)/var
+        outputs x, mean and var
+        """
+        
+        ## ANN Map
+        self.mean, self.logvar = self.encode(tf.cast(tf.reshape(X_d, [1,self.nlat, self.nlon, self.n_channels]), dtype='float64'))
+        self.z = self.reparameterize(self.mean, self.logvar)
+        x = self.decode(self.z)
+        x = tf.reshape(x, (-1,1))
+        return x
+    
+    def log_prob(self, y_pred, y_l, y_true):
+        self.m, self.v = self.gp(y_pred, y_l)
+        loss = tf.math.reduce_mean((y_true-self.m)**2/self.v)
+        loss += tf.math.reduce_mean(tf.math.log(self.v))
+        loss += tf.math.reduce_mean( self.z**2 )
+        loss -= tf.math.reduce_mean( (self.z - self.mean)**2*tf.exp(-self.logvar) + self.logvar )
+        return loss
+
+class ResnetIdentityBlock(keras.Model):
+    def __init__(self, kernel_size, filters, identity=False, name='ResnetBlock'):
+        super(ResnetIdentityBlock, self).__init__(name=name, dtype='float64')
+        filters1, filters2, filters3 = filters
+        self.identity = identity
+        self.conv2a = tf.keras.layers.Conv2D(filters1, (1,1))
+        self.bn2a = tf.keras.layers.BatchNormalization(fused=False)
+
+        self.conv2b = tf.keras.layers.Conv2D(filters2, kernel_size, padding='same')
+        self.bn2b = tf.keras.layers.BatchNormalization(fused=False)
+
+        self.conv2c = tf.keras.layers.Conv2D(filters3, (1,1))
+        self.bn2c = tf.keras.layers.BatchNormalization(fused=False)
+
+        self.convid = tf.keras.layers.Conv2D(filters3, (1,1), padding='same')
+    
+    def call(self, input_tensor, training=False):
+        x = self.conv2a(input_tensor)
+        x = self.bn2a(x, training = training)
+        x = tf.nn.relu(x)
+
+        x = self.conv2b(x)
+        x = self.bn2b(x, training = training)
+        x = tf.nn.relu(x)
+
+        x = self.conv2c(x)
+        x = self.bn2c(x, training = training)
+        if self.identity:
+            x += self.convid(input_tensor, training=training)
+        return tf.nn.relu(x)
+
+class Resnet(keras.Model):
+    r"""
+    Implements a residual neural network for the relationship x = f(X) + b + noise, 
+    where X = (nlat, nlon, n_channels) with training model y = Lx + V, where L and V 
+    are obtained via GP regression.
+    
+    Input arguments - nlon, number of rows (longitude) of X
+                    - nlat, number of columns (latitude) of X
+                    - n_channels, number of columns of X
+                    - x_l,  locations of inputs, shape (input_dim, 2)
+                            columns house (lon,lat) coordinates respectively.
+                    - y_l, locations of training data
+                    - y_d, training data values
+                            
+    Output arguments - x, estimate of x = f(X) + noise
+                     - m, mean estimate of m = Lx + V
+                     - v, diagonal variance of gp covariance V
+                     
+    Parameters       - w_i, linear weight matrix, shape (input_dim, n_features)
+                     - b_i, bias, shape (input_dim, )
+    
+    Inherited Parameters - input_noise, input-dependent noise estimate, shape (input_dim,)
+                         gives estimate of variances 
+                         - .gp.amplitude, kernel amplitude
+                         - .gp.length_Scale, kernel length scale
+    
+    
+    """
+    def __init__(self, nlat, nlon, n_channels, x_l, dtype='float64', **kwargs):
+        super(Resnet, self).__init__(name='residual_neural_network', dtype='float64', **kwargs)
+        
+        # Sizes
+        self.nlat = nlat
+        self.nlon = nlon
+        self.n_channels = n_channels
+        
+        # Initialize grid and gaussian process        
+        self.x_l = x_l
+        self.gp = GPR(x_l)
+        
+        
+        # Parameters, w, b, input_noise
+        # Linear weights
+        self.L = tf.keras.Sequential(
+            [
+                tf.keras.layers.InputLayer(input_shape = (self.nlat, self.nlon, self.n_channels)),
+                tf.keras.layers.Conv2D(self.nlat, (3, 3), activation='relu',),
+                tf.keras.layers.Conv2D(self.nlat, (3, 3), activation='relu',),
+                tf.keras.layers.MaxPooling2D((2,2)),
+                
+                ResnetIdentityBlock(3, (self.nlat, self.nlat, self.nlat), name='resnet1'),
+                ResnetIdentityBlock(3, (self.nlat, self.nlat, self.nlat), name='resnet2'),
+                ResnetIdentityBlock(3, (self.nlat, self.nlat, self.nlat), name='resnet3'),
+                tf.keras.layers.MaxPooling2D((2,2)),
+                ResnetIdentityBlock(3, (2*self.nlat, 2*self.nlat, 2*self.nlat), identity=False, name='resnet4'),
+                ResnetIdentityBlock(3, (2*self.nlat, 2*self.nlat, 2*self.nlat), name='resnet5'),
+                ResnetIdentityBlock(3, (2*self.nlat, 2*self.nlat, 2*self.nlat), name='resnet6'),
+                tf.keras.layers.MaxPooling2D((2,2)),
+                ResnetIdentityBlock(3, (4*self.nlat, 4*self.nlat, 4*self.nlat), identity=False, name='resnet7'),
+                ResnetIdentityBlock(3, (4*self.nlat, 4*self.nlat, 4*self.nlat), name='resnet8'),
+                ResnetIdentityBlock(3, (4*self.nlat, 4*self.nlat, 4*self.nlat), name='resnet9'),
+                tf.keras.layers.MaxPooling2D((2,2)),                
+                tf.keras.layers.Flatten(),
+                tf.keras.layers.Dense(self.nlat*self.nlon, activation = 'relu',
+                    kernel_regularizer = tf.keras.regularizers.l2(1e-3) ),
+                tf.keras.layers.Dense(self.nlat*self.nlon,kernel_regularizer = tf.keras.regularizers.l2(1e-3) ),
+            ]
+        )               
+    def call(self, X_d, training=True):
+        r"""
+        Produces an estimate x for the latent variable x = f(X) + noise
+        With that estimate x, projects to the output space m = Lx + var
+        where the loss is calculated as l = (y_d - mean)(y_d - mean)/var
+        outputs x, mean and var
+        """
+        
+        ## ANN Map
+        x = self.L(tf.cast(tf.reshape(X_d, [1, self.nlat, self.nlon, self.n_channels]), dtype='float64'), training)
+        x = tf.reshape(x, (-1, 1))
+        return x
+    
+    def log_prob(self, y_pred, y_l, y_true):
+        self.m, self.v = self.gp(y_pred, y_l)
+        loss = tf.math.reduce_mean((y_true-self.m)**2/self.v)
+        loss += tf.reduce_sum(self.L.losses)
+        loss += tf.math.reduce_mean(tf.math.log(self.v))
+        return loss
 
 ####################################################################################
 ########################### Training Proceedure ####################################
@@ -496,7 +939,7 @@ def train_func(dataset, model, epochs = 500, print_epoch = 100, lr = 0.001, num_
             X_d, X_l, y_d, y_l = dataset.get_index(dataset.i_train[batch[steps-1]])
             with tf.GradientTape() as dtape:
                 dtape.watch(model.trainable_variables[-2:])
-                x = model(X_d.reshape(-1,3))
+                x = model(X_d.reshape(-1,3) + 1e-3*np.random.randn(model.input_dim, 3))
                 loss += model.log_prob(x, y_l.reshape(-1,2), y_d) 
 
             
@@ -508,14 +951,14 @@ def train_func(dataset, model, epochs = 500, print_epoch = 100, lr = 0.001, num_
             variables[epoch, 0] += model.gp.amplitude.numpy()/n_steps_train
             variables[epoch, 1] += model.gp.length_scale.numpy()/n_steps_train
             variables[epoch, 2] += tf.math.reduce_mean(model.gp.input_noise).numpy()/n_steps_train
-            variables[epoch, 4] += np.linalg.norm(model.v.numpy())/n_steps_train/np.sqrt(model.input_dim)
-            variables[epoch, 5] += np.linalg.norm(model.m.numpy())/n_steps_train/np.sqrt(model.input_dim)
-            variables[epoch, 6] += np.linalg.norm(x.numpy())/n_steps_train/np.sqrt(model.input_dim)
+            variables[epoch, 4] += np.linalg.norm(model.v.numpy())/n_steps_train
+            variables[epoch, 5] += np.linalg.norm(model.m.numpy())/n_steps_train
+            variables[epoch, 6] += np.linalg.norm(x.numpy())/n_steps_train
 
             if steps % mini_batch_size == 0:
                 # Apply gradients to model parameters
-                grads = dtape.gradient(loss, model.trainable_variables[-2:])
-                optimizer.apply_gradients(zip(grads, model.trainable_variables[-2:]))
+                grads = dtape.gradient(loss, model.trainable_variables[3:])
+                optimizer.apply_gradients(zip(grads, model.trainable_variables[3:]))
                 loss = 0
 
         
@@ -539,14 +982,17 @@ def train_func(dataset, model, epochs = 500, print_epoch = 100, lr = 0.001, num_
                                          'test correlation = {:.2f}'.format(losses[epoch,5]),
                  )
         
-        if losses[epoch,0] < early_stopping_min_value:
-            early_stopping_min_value = losses[epoch, 0]
+        if losses[epoch,3] < early_stopping_min_value:
+            early_stopping_min_value = losses[epoch, 3]
             early_stopping_counter = 0
+            model.save_weights('./saved_model/temp/temp_model_save')
         else:
             early_stopping_counter += 1
         if early_stopping_counter > num_early_stopping:
             print('Early Stopping at iteration {:d}'.format(epoch))
             break
+    model.load_weights('./saved_model/temp/temp_model_save')
+    model.save_weights('./saved_model/'+model.name+'{:.3f}'.format(early_stopping_min_value))
     return losses[:epoch, :], variables[:epoch, :]
 
 ####################################################################################
