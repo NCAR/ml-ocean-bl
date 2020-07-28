@@ -5,13 +5,79 @@
 ####################################################################################
 
 # This file creates a class that imports preprocessed sss data, sst data, and ssh data 
-# It currently hosts a number of plot creation functions. It will hold all of the code
-# for the potential models that we will test.
+# as well as mld data using the dataset class and methods. Using this class, users 
+# can treat the 'get_index' method as an iterator to draw individual weeks from the
+# data set for use in training various machine learning models.
 
-## TO DO
-# Add argo data
-# Add models
-# Add plot creation
+# There are a number of machine learning models coded in this documents. The first
+# two class set up the gaussian process regression:
+#           1. ExponentiatedQuadratic - implements kernel with haversine distance
+#           2. GPR - implements gaussian process regression. Optimizes hyper parameters
+#                   by maximum likelihood 
+#           
+#  Next machine learning models take sss, sst, ssh data as inputs and produce dense
+#  grid predictions. Using the log_prob method of each model class we link the dense
+#  grid to the sparse mld argo observation network via the gaussian process regression
+#  class. The available models are:
+#           3. Linear
+#           4. ANN
+#           5. Variational ANN (ANN_distribution)
+#           6. Dropout ANN
+#           7. Bayesian NN (Flipout)
+#           8. Variational AutoEncoder (VAE)
+#  For full details, see associated text with each method. 
+# 
+# train_minibatch is the currently implemented training routine. As the title suggests,
+# It implements a minibatch training algorithm, currently using Adam with a user-specified
+# learning rate. It estimates log loss, probabilistic calibration, and correlation 
+# coefficient for the training and testing set, which is then printed. It has a built in
+# early stopping criterion currently based off of progress in the test correlation coefficient.
+#
+#
+# An minimal working example:
+# import numpy as np
+# import models
+# import tensorflow as tf
+#
+# # Select a certain lat, lon region
+# lat_bounds = np.array([-25, -5])
+# lon_bounds = np.array([65, 85])
+#
+# # Create the dataset
+# data = models.dataset(lat_bounds, lon_bounds)
+# 
+# # Normalize data according to training data
+# data.normalize()
+# 
+# # Obtain the indices for the train/test/val split (determined during preprocessing)
+# i_train, i_test, i_val = data.i_train, data.i_test, data.i_val
+#
+# # Usage for obtaining data from dataset
+# # .get_index( index ) retrieves the data according to week corresponding to index
+# # X_d - input data (sss, sst, sha)
+# # X_l - input data locations (lon, lat)
+# # y_d - mld data
+# # y_l - mld locations
+#
+# X_d, X_l, y_d, y_l = data.get_index(i_train[0])
+#
+# # Call of methods is models.METHOD( input dimensions, number of features, input data locations )
+# input_dim = X_d.shape[0]
+# n_features = X_d.shape[1]
+# lp = models.Linear(input_dim, n_features, X_l)
+# 
+# # Train model
+# loss  = models.train_func(data,                       # Pass the data set
+#                           lp,                         # Pass the model
+#                           epochs=300,                 # Max Number of Epochs
+#                           print_epoch = 1,            # Printing frequency
+#                           lr = 3e-4,                  # Optimizer learning rate
+#                           num_early_stopping = 20,    # Epochs from optimum to continue optimizer
+#                           mini_batch_size = 25,       # Batch size should be divisor of 150
+#                           )
+
+
+
 
 
 ####################################################################################
@@ -22,13 +88,11 @@ import matplotlib.pyplot as plt
 import pandas as pd
 import numpy as np
 from netCDF4 import Dataset
-import seaborn as sns
 import cartopy
 import cartopy.crs as ccrs
 from mpl_toolkits.basemap import maskoceans
 import tensorflow as tf
 import tensorflow.keras as keras
-import gpflow as gpf
 import tensorflow_probability as tfp
 tf.keras.backend.set_floatx('float64')
 tfd = tfp.distributions
@@ -40,62 +104,88 @@ tfb = tfp.bijectors
 
             
 class dataset:
-    def __init__(self, x_data, lon, lat, y_data, m_lon, m_lat, lat_bounds, lon_bounds):
-        self.X_data = np.stack(x_data, axis=-1)
+    def __init__(self, lat_bounds, lon_bounds, anomalies=True, CNN = False):
+
+        with xr.open_dataset('./data/sss_sst_ssh_normed_anomalies_weekly.nc') as ds:
+            print(ds)
+            sal = ds.salinity.values.astype(np.float64)
+            sal_anom = ds.salinity_anomaly.values.astype(np.float64)
+            temp = ds.temperature.values.astype(np.float64)
+            temp_anom = ds.temperature_anomaly.values.astype(np.float64)
+            height = ds.height.values.astype(np.float64)
+            lat = ds.lat.values.astype(np.float64)
+            lon = ds.lon.values.astype(np.float64)
+            self.time = ds.time.values
+            self.i_train = ds.training_index.values
+            self.i_test = ds.testing_index.values
+            self.i_val  = ds.validation_index.values
+
+        with xr.open_dataset('./data/mldbmax_full_anomalies_weekly_full.nc') as ds:
+            print(ds)
+            mldb = ds.copy()
+            self.y_week = mldb['week']
+
+        if anomalies:
+            self.X_data = np.stack((sal_anom, temp_anom, height), axis=-1)
+            self.y_data = mldb['mldb']
+        else:
+            self.X_data = np.stack((sal, temp, height), axis=-1)
+            self.y_data = mldb['mldb_full']
+
+
         lat_mask = (lat < lat_bounds[1]) & (lat > lat_bounds[0])
         lon_mask = (lon < lon_bounds[1]) & (lon > lon_bounds[0])
-        self.mask = np.isfinite(x_data[0].mean(axis=0))
+        self.mask = np.isfinite(self.X_data[:, :, :, 0].mean(axis=0))
+        if CNN:
+            self.X_data[:, ~self.mask, :] = 0.0
+            self.mask = np.isfinite(self.X_data[:, :, :, 0].mean(axis=0))
         self.mask[~lat_mask, :] = False
         self.mask[:, ~lon_mask] = False
-        self.X_data = np.stack(x_data, axis=-1)[:, self.mask, :]
+        self.X_data = self.X_data[:, self.mask, :]
         
         [LAT, LON] = np.meshgrid(lat, lon, indexing='ij')
         self.X_loc = np.stack((LON[self.mask], LAT[self.mask]), axis=-1)
-        self.y_data = y_data
-        self.y_loc = np.stack((m_lon, m_lat), axis=-1)
+
+        self.y_data = self.y_data.where(
+            (mldb.lat < lat_bounds[1]) & (mldb.lat > lat_bounds[0]) & \
+            (mldb.lon < lon_bounds[1]) & (mldb.lon > lon_bounds[0])
+            ).dropna('index')
+        self.y_week = self.y_week.where(
+            (mldb.lat < lat_bounds[1]) & (mldb.lat > lat_bounds[0]) & \
+            (mldb.lon < lon_bounds[1]) & (mldb.lon > lon_bounds[0])
+            ).dropna('index')
+        self.y_lat = mldb['lat'].where(
+            (mldb.lat < lat_bounds[1]) & (mldb.lat > lat_bounds[0]) & \
+            (mldb.lon < lon_bounds[1]) & (mldb.lon > lon_bounds[0])
+            ).dropna('index')
+        self.y_lon = mldb['lon'].where(
+            (mldb.lat < lat_bounds[1]) & (mldb.lat > lat_bounds[0]) & \
+            (mldb.lon < lon_bounds[1]) & (mldb.lon > lon_bounds[0])
+            ).dropna('index')
+
         self.lat_bounds = lat_bounds
         self.lon_bounds = lon_bounds
         
-    def normalize(self, train_index):
+    def normalize(self):
         
         for i in range(self.X_data.shape[-1]):
-            self.X_data[:, :, i] = normalize(self.X_data[:, :, i], train_index)
+            self.X_data[:, :, i] = normalize(self.X_data[:, :, i], self.i_train)
         
-        self.y_data = normalize(self.y_data, train_index)
+        self.y_mean = self.y_data.where(np.in1d(self.y_week, self.time[self.i_train])).dropna('index').mean().values
+        self.y_std = self.y_data.where(np.in1d(self.y_week, self.time[self.i_train])).dropna('index').std().values
+        self.y_data = (self.y_data - self.y_mean)/self.y_std
         
     def get_index(self, index):
-        mask = (self.y_loc[index, :, 1]<self.lat_bounds[1]) & (self.y_loc[index, :, 1]>self.lat_bounds[0]) & \
-                (self.y_loc[index, :, 0]<self.lon_bounds[1]) & (self.y_loc[index, :, 0]>self.lon_bounds[0])
-
-        y = self.y_data[index, mask].reshape(-1, 1)
-        y_loc = self.y_loc[index, mask, :]
-        return self.X_data[index], self.X_loc, y, y_loc
+        y = self.y_data.where(np.in1d(self.y_week, self.time[index])).dropna('index').values
+        y_loc = np.stack( (self.y_lon.where(np.in1d(self.y_week, self.time[index])).dropna('index'), 
+                            self.y_lat.where(np.in1d(self.y_week, self.time[index])).dropna('index')),
+                            axis=-1)
+        return self.X_data[index].astype(np.float64), self.X_loc.astype(np.float64), y.astype(np.float64), y_loc.astype(np.float64)
     
-    def train_test_val_indices(self, n, n_train, n_test):
-        n_validate = n - n_train -  n_test
-        assert n_validate > 0, print('Validation size must be positive')
-        i = np.arange(n)
-        np.random.seed(0)
-        np.random.shuffle(i)
-        self.i_train = i[:n_train]
-        self.i_test = i[n_train:n_train+n_test]
-        self.i_validate = i[n_train+n_test:]
-        return i[:n_train], i[n_train:n_train+n_test], i[n_train+n_test:]
-
-    def calc_covariance(self, indicies):
-        return np.var(self.X_data[indicies], axis = 0)
 
 ####################################################################################
 ########################### Preprocess Models ######################################
 ####################################################################################
-
-def train_test_val_indices(n, n_train, n_test):
-    n_validate = n - n_train -  n_test
-    assert n_validate > 0, print('Validation size must be positive')
-    i = np.arange(n)
-    rng = np.random.default_rng(10)
-    np.random.shuffle(i)
-    return i[:n_train], i[n_train:n_train+n_test], i[n_train+n_test:]
 
 def normalize(inputs, train_index):
     return (inputs - np.nanmean(inputs[train_index], axis=0))/np.nanstd(inputs[train_index], axis=0)
@@ -105,118 +195,180 @@ def normalize(inputs, train_index):
 ####################################################################################
 ########################### Define Models ##########################################
 ####################################################################################
-    
+
+from tensorflow_probability.python.internal import tensor_util
+from tensorflow_probability.python.math.psd_kernels.internal import util
+from tensorflow_probability.python.math.psd_kernels.positive_semidefinite_kernel import PositiveSemidefiniteKernel
+
+class ExponentiatedQuadratic(PositiveSemidefiniteKernel):
+    def __init__(self,
+               amplitude=None,
+               length_scale=None,
+               feature_ndims=1,
+               validate_args=False,
+               name='ExponentiatedQuadratic'):
+        parameters = dict(locals())
+        with tf.name_scope(name):
+            dtype = util.maybe_get_common_dtype(
+                [amplitude, length_scale])
+        self._amplitude = tensor_util.convert_nonref_to_tensor(
+          amplitude, name='amplitude', dtype=dtype)
+        self._length_scale = tensor_util.convert_nonref_to_tensor(
+          length_scale, name='length_scale', dtype=dtype)
+        super(ExponentiatedQuadratic, self).__init__(
+              feature_ndims,
+              dtype=dtype,
+              name=name,
+              validate_args=validate_args,
+              parameters=parameters)
+
+    @property
+    def amplitude(self):
+        """Amplitude parameter."""
+        return self._amplitude
+
+    @property
+    def length_scale(self):
+        """Length scale parameter."""
+        return self._length_scale
+
+    def _batch_shape(self):
+        scalar_shape = tf.TensorShape([])
+        return tf.broadcast_static_shape(
+            scalar_shape if self.amplitude is None else self.amplitude.shape,
+            scalar_shape if self.length_scale is None else self.length_scale.shape)
+
+    def _batch_shape_tensor(self):
+        return tf.broadcast_dynamic_shape(
+            [] if self.amplitude is None else tf.shape(self.amplitude),
+            [] if self.length_scale is None else tf.shape(self.length_scale))
+
+    def _apply(self, x1, x2, example_ndims=0):
+        x1 = tf.reshape(x1, (-1, 2))
+        x2 = tf.reshape(x2, (-1, 2))
+        exponent = -0.5 * haversine_dist(x1, x2)
+        if self.length_scale is not None:
+            length_scale = tf.convert_to_tensor(self.length_scale)
+            length_scale = util.pad_shape_with_ones(
+              length_scale, example_ndims)
+            exponent = exponent / length_scale**2
+
+        if self.amplitude is not None:
+            amplitude = tf.convert_to_tensor(self.amplitude)
+            amplitude = util.pad_shape_with_ones(amplitude, example_ndims)
+            exponent = exponent + 2. * tf.math.log(amplitude)
+        return tf.exp(exponent)
+
+    def _parameter_control_dependencies(self, is_init):
+        if not self.validate_args:
+            return []
+        assertions = []
+        for arg_name, arg in dict(amplitude=self.amplitude,
+                              length_scale=self.length_scale).items():
+            if arg is not None and is_init != tensor_util.is_ref(arg):
+                assertions.append(assert_util.assert_positive(
+                arg,
+                message='{} must be positive.'.format(arg_name)))
+        return assertions
+
+def haversine_dist(X, X2):
+    pi = np.pi / 180
+    f = tf.expand_dims(X * pi, -2)  # ... x N x 1 x D
+    f2 = tf.expand_dims(X2 * pi, -3)  # ... x 1 x M x D
+    d = tf.sin((f - f2) / 2) ** 2
+    lat1, lat2 = tf.expand_dims(X[:, 0] * pi, -1), \
+                tf.expand_dims(X2[:, 0] * pi, -2)
+    cos_prod = tf.cos(lat2) * tf.cos(lat1)
+    a = d[:,:,0] + cos_prod * d[:,:,1]
+    c = tf.asin(tf.sqrt(a)) * 6371 * 2
+    return c
+
 class GPR(keras.Model):
     def __init__(self, x_l, dtype='float64', **kwargs):
         super(GPR, self).__init__(name='gaussian_process', dtype='float64', **kwargs)
-        self.x_l = x_l
+        self.x_l = tf.cast(x_l, dtype='float64')
         self.input_dim = self.x_l.shape[0]
 
-        self.amplitude = tf.Variable(np.float64(2.0), dtype='float64',
-                                          trainable=True, name='amplitude')
-        self.length_scale = tf.Variable(np.float64(1.0), dtype='float64', 
-                                            trainable=True, name='length_scale')
+        self.amplitude = tf.Variable(
+            initial_value=1.,
+            constraint = tf.keras.constraints.NonNeg(),
+            name='amplitude',
+            trainable=True,
+            dtype=np.float64)
 
-        self.input_noise = tf.Variable(1e-4*tf.ones([self.input_dim,], dtype='float64'),
-                                            trainable=True, name='input_noise')
+        self.length_scale = tf.Variable(
+            initial_value=20.,
+            constraint = tf.keras.constraints.NonNeg(),
+            name='length_scale',
+            trainable=True,
+            dtype=np.float64)
+
+        self.noise_variance = tf.Variable(
+            initial_value=1.e-3,
+            constraint = tf.keras.constraints.NonNeg(),
+            trainable=True,
+            name='observation_noise_variance_var',
+            dtype=np.float64)
+        
+
+    def optimize(self, x, gp, optimizer):
+        with tf.GradientTape() as tape:
+            tape.watch(gp.trainable_variables)
+            loss = -gp.log_prob(x)
+        grads = tape.gradient(loss, gp.trainable_variables)
+        optimizer.apply_gradients(zip(grads, gp.trainable_variables))
+        return loss
     
     def call(self, x, y_l, noise = None):
         # Calculuates a gaussian process
         # m = Lx + V
         # where L = Kyx (Kxx + \sigmaI)^{-1}
         # where V = Kyy - L Kxy + L\sigmaIL^{T}
-        
-        self.train(x)
-        Kxx = self.kernel(self.x_l)
-        Kxy = self.kernel(self.x_l, y_l)
-        Kyy = self.kernel(y_l, y_l)
-        k_diag = tf.linalg.diag_part(Kxx)
-        s_diag = tf.fill([self.input_dim], np.float64(1e-3))
-        ks = tf.linalg.set_diag(Kxx, 
-                k_diag + s_diag + tf.nn.softplus(self.input_noise))
+        kernel = ExponentiatedQuadratic(
+                    self.amplitude,
+                    self.length_scale)
+        # gp = tfd.GaussianProcess(
+        #     kernel=kernel,
+        #     index_points=self.x_l,
+        #     observation_noise_variance=self.noise_variance,
+        #     jitter = 1e-6)
+        # optimizer = tf.optimizers.Adam(learning_rate=1e-2)
+        # for i in range(10):
+            # neg_log_likelihood_ = self.optimize(x, gp, optimizer)
 
-        L = tf.linalg.cholesky(ks)
-        m = tf.linalg.matmul(Kxy, 
-            tf.linalg.cholesky_solve(L, x), 
-            transpose_a = True
-        )
-        v = Kyy - tf.linalg.matmul(Kxy, 
-            tf.linalg.cholesky_solve(L, Kxy), 
-            transpose_a = True
-        ) 
-        if noise != None:
-            noise_v = tf.linalg.matmul(Kxy,
-                tf.linalg.cholesky_solve(L, 
-                tf.linalg.diag(  tf.math.sqrt(tf.nn.softplus(noise)) )),
-                transpose_a = True)
-            noise_v = tf.linalg.matmul(noise_v, noise_v, transpose_b = True)
-        
-            return m, tf.linalg.diag_part(v+noise_v)
-        else:
-            return m, tf.linalg.diag_part(v)
-
-
-    def train(self, x):
-        opt = keras.optimizers.Adam(1e-3)
-        self.x = x
-        for j in range(5):
-            opt.minimize(self.log_prob, self.trainable_variables)
-
-    def log_prob(self):
-        # Calculates the log probability for the
-        # gaussian prior.
-        
-        K = self.kernel(self.x_l)
-        k_diag = tf.linalg.diag_part(K)
-        s_diag = tf.fill([self.input_dim], np.float64(1e-4))
-        ks = tf.linalg.set_diag(K, k_diag + s_diag + tf.nn.softplus(self.input_noise) )
-        L = tf.linalg.cholesky(ks)
-        d = tfd.MultivariateNormalTriL(loc = tf.zeros([self.input_dim], dtype='float64'), 
-                                        scale_tril = L)
-        l = -d.log_prob(tf.reshape(self.x, [1, self.input_dim]))
-        d_a = tfd.LogNormal(loc=np.float64(0.0), scale = np.float64(1.0))
-        l -= d_a.log_prob(self.amplitude)
-        l -= d_a.log_prob(self.length_scale)
-        d_g = tfd.Gamma(concentration = np.float64(2.0), 
-                            rate = np.float64(2.0))
-        l -= tf.math.reduce_mean(d_g.log_prob(self.input_noise))
+                
+        Kxx = kernel._apply(self.x_l, self.x_l) + self.noise_variance*tf.eye(self.input_dim, dtype='float64')
+        if noise is not None:
+            Kxx += tf.linalg.diag(noise)
+        Kxy = kernel._apply(self.x_l, y_l)
+        Kyy = kernel._apply(y_l, y_l)
+        Kyy = tf.linalg.set_diag( Kyy, tf.linalg.diag_part(Kyy) + 1e-6)
+        K_chol = tf.linalg.cholesky(Kxx)
+        self.m = tf.linalg.matmul(Kxy,
+                            tf.linalg.cholesky_solve(K_chol, tf.reshape(x, (-1,1))),
+                            transpose_a = True)
+        self.V = Kyy - tf.linalg.matmul(Kxy,
+                                  tf.linalg.cholesky_solve(K_chol, Kxy),
+                                  transpose_a = True)
+        self.V_chol = tf.linalg.cholesky(self.V)
+        return tf.reshape(self.m, (-1,)), tf.linalg.diag_part(self.V)
+    
+    def sample(self, size, num_samples = 1):
+        noise = tf.random.normal( (size, num_samples), dtype='float64')
+        sample = self.m + tf.linalg.matmul(
+                    self.V_chol,
+                    noise,
+                    )
+        return tf.reshape(sample, (-1,1))
+    
+    def log_prob(self, x):
+        z = (self.m - tf.reshape(x, (-1,1)))
+        l = -0.5 * tf.matmul(z, 
+                            tf.linalg.cholesky_solve(self.V_chol,
+                                         z),
+                            transpose_a = True)
+        l -= 0.5*tf.math.reduce_sum(tf.math.log(tf.linalg.diag_part(self.V_chol)))
         return l
-        
-    def convert_(self, x):
-        xx = np.stack( (np.sin(np.deg2rad(90.0-x[:,1]))*np.cos(np.deg2rad(x[:,0]+180.0)),  
-                     np.sin(np.deg2rad(90.0-x[:,1]))*np.sin(np.deg2rad(x[:,0]+180.0)),
-                     np.cos(np.deg2rad(90.0-x[:,1]))), axis=-1)
-        xx = tf.cast(xx, dtype='float64')
-        return xx
-
-    def kernel(self, X, X2=None):
-        if X2 is None:
-            X2 = X
-        X = self.convert_(X)
-        X2 = self.convert_(X2)
-        dist = tf.linalg.matmul(X, X2, transpose_b=True)
-        dist = tf.clip_by_value(dist, -1, 1) # Needed for numerical stability
-        dist = 60*tf.math.acos(dist)
-        return self.matern(dist)
-
-    def matern(self, dist):
-        z = tf.math.sqrt(np.float64(5.0)) * dist / self.length_scale
-        z = self.amplitude*(np.float64(1.0) + z + (z ** 2) / 3) * tf.math.exp(-z)
-        return z
-
-class DenseIdentityBlock(keras.Model):
-    def __init__(self,  output_dim, name='DenseIdentityBlock'):
-        super(DenseIdentityBlock, self).__init__(name=name, dtype='float64')
-        self.num_layers = num_layers
-        self.dense1 = tf.keras.layers.Dense(output_dim, activation='relu')
-        self.dense2 = tf.keras.layers.Dense(output_dim, activation='relu')
-        self.dense3 = tf.keras.layers.Dense(output_dim, activation='relu')
-        self.dropout = tf.keras.layers.Dropout(0.1)
-    def call(self, input_tensor, training=False):
-        x = self.dense1(input_tensor)
-        x = self.dense2(x)
-        x += input_tensor + self.dense3(input_tensor)*tf.random.normal(input_tensor.shape, stddev = 0.01, dtype='float64')
-        return x
     
 class Linear(keras.Model):
     r"""
@@ -281,136 +433,17 @@ class Linear(keras.Model):
         ## Linear Map
         x = tf.math.multiply(x, self.w)
         x = tf.math.reduce_sum(x, axis=1) + self.b
-        x = tf.reshape(x, (-1, 1))
+        x = tf.reshape(x, (-1,))
         
         return x
     
-    def log_prob(self, y_pred, y_l, y_true):
-        # Calculate log probability as a loss
+    
+    def log_prob(self, y_pred, y_l, y_true, y_size):
         self.m, self.v = self.gp(y_pred, y_l)
-        loss = tf.math.reduce_mean((y_true-self.m)**2/self.v)
-        loss += tf.math.reduce_mean(tf.math.log(self.v))
-
+        self.sample = self.gp.sample(y_size)
+        loss = -self.gp.log_prob( y_true )
         return loss
     
-    
-    def grad(self, X_d, y_l, y_d):
-        # Calculate gradients manually
-        knn = self.gp.kernel(self.x_l)
-        s = tf.linalg.diag(tf.fill([self.input_dim], np.float64(1e-3)))
-        s += tf.linalg.diag(tf.math.log(1+tf.math.exp(self.gp.input_noise)))
-        kmn = self.gp.kernel(y_l, self.x_l)
-        K = tf.linalg.matmul(kmn,
-                tf.linalg.cholesky_solve(
-                    tf.linalg.cholesky(knn+s), 
-                    tf.eye(self.input_dim, dtype='float64')
-                    )
-                    )
-        
-        dJdb_temp = y_d.reshape(-1, 1) 
-        dJdb_temp -= tf.linalg.matmul(K, 
-                                      tf.reshape(
-                                          tf.math.reduce_sum(tf.math.multiply(X_d, self.w), axis=1),
-                                          [self.input_dim, 1])) 
-        dJdb_temp -= tf.linalg.matmul(K, 
-                                      tf.reshape(self.b, [self.input_dim,1]))
-        dJdb_temp = tf.linalg.matmul(K, dJdb_temp, transpose_a = True)
-        dJdb = -dJdb_temp
-        dJdL = -tf.math.multiply(X_d, dJdb_temp)
-        return dJdL, tf.reshape(dJdb, [self.input_dim,])
-    
-class DenseLinear(keras.Model):
-    r"""
-    Implements linear model x = LX + b + noise, where X = np.vstack(X[0], X[1], ...)
-    with training model y = Lx + V, where L and V are obtained via GP regression.
-    Input noise is estimated along with parameters w and b.
-    
-    Input arguments - input_dim, number of rows of X
-                    - n_features, number of columns of X
-                    - x_l,  locations of inputs, shape (input_dim, 2)
-                            columns house (lon,lat) coordinates respectively.
-                    - y_l, locations of training data
-                    - y_d, training data values
-                            
-    Output arguments - x, estimate of x = f(X) + noise
-                     - m, mean estimate of m = Lx + V
-                     - v, diagonal variance of gp covariance V
-                     
-    Parameters       - w, linear weight matrix, shape (input_dim, n_features)
-                     - b, bias, shape (input_dim, )
-    
-    Inherited Parameters - input_noise, input-dependent noise estimate, shape (input_dim,)
-                         gives estimate of variances 
-                         - .gp.amplitude, kernel amplitude
-                         - .gp.length_scale, kernel length scale
-    
-    
-    """
-    def __init__(self, input_dim, n_features, x_l, dtype='float64', **kwargs):
-        super(DenseLinear, self).__init__(name='dense_linear_projection', dtype='float64', **kwargs)
-        
-        # Sizes
-        self.input_dim = input_dim
-        self.n_features = n_features
-        
-        # Initialize grid and gaussian process        
-        self.x_l = x_l
-        self.gp = GPR(x_l)
-        
-        # Parameters, w, b, input_noise
-        # Linear weights
-        self.L = tf.keras.layers.Dense(self.input_dim, 
-                                       input_shape=(self.n_features*self.input_dim,),
-                                       kernel_regularizer = tf.keras.regularizers.l1(1e-2),
-                                       bias_regularizer = tf.keras.regularizers.l1(1e-2)
-                                      )
-        
-    def call(self, x):
-        r"""
-        Produces an estimate x for the latent variable x = f(X) + noise
-        With that estimate x, projects to the output space m = Lx + var
-        where the loss is calculated as l = (y_d - mean)(y_d - mean)/var
-        outputs x, mean and var
-        """
-
-        ## Linear Map
-        x = self.L(tf.cast(tf.reshape(x, [1,-1]), dtype='float64'))
-        x = tf.reshape(x, (-1, 1))
-        
-        return x
-    
-    def log_prob(self, y_pred, y_l, y_true):
-        
-        self.m, self.v = self.gp(y_pred, y_l)
-        loss = tf.math.reduce_mean((y_true-self.m)**2/self.v)
-        loss += tf.math.reduce_mean(tf.math.log(self.v))
-        loss += tf.math.reduce_sum(self.L.losses)
-        return loss
-    
-    
-    def grad(self, X_d, y_d):
-        # Code for manual gradients
-        knn = self.k(self.x_l)
-        s = tf.linalg.diag(tf.fill([self.input_dim], self.m.likelihood.variance))
-        s += tf.linalg.diag(self.input_noise)
-        kmn = self.k(self.y_l, self.x_l)
-        K = tf.linalg.matmul(kmn,
-                tf.linalg.cholesky_solve(
-                    tf.linalg.cholesky(knn+s), 
-                    tf.eye(self.input_dim, dtype='float64')
-                    )
-                    )
-
-        dJdb_temp = y_d.reshape(-1, 1) 
-        dJdb_temp -= tf.linalg.matmul(K, 
-                                      tf.linalg.matmul(self.L.kernel, X_d.reshape(-1,1), transpose_a = True)) 
-        dJdb_temp -= tf.linalg.matmul(K, 
-                                      tf.reshape(self.L.bias, [self.input_dim,1]))
-        dJdb_temp = tf.linalg.matmul(K, dJdb_temp, transpose_a = True)
-        dJdb = -dJdb_temp
-        dJdL = -tf.transpose(tf.linalg.matmul(dJdb_temp, X_d.reshape(-1,1), transpose_b = True))
-        return dJdL, tf.reshape(dJdb, [self.input_dim,])
-       
 class ANN(keras.Model):
     r"""
     Implements an artificial neural network for the relationship x = f(X) + b + noise, 
@@ -449,7 +482,7 @@ class ANN(keras.Model):
         self.x_l = x_l
         self.gp = GPR(x_l)
         
-        # l1 = tf.keras.regularizers.l1(1e-4)
+        l1 = tf.keras.regularizers.l2(5e-3)
         
         # Parameters, w, b, input_noise
         # Linear weights
@@ -490,13 +523,13 @@ class ANN(keras.Model):
         
         ## ANN Map
         x = self.L(tf.cast(tf.reshape(X_d, [1,-1]), dtype='float64'), training=True)
-        x = tf.reshape(x, (-1, 1))
+        x = tf.reshape(x, (-1, ))
         return x
     
-    def log_prob(self, y_pred, y_l, y_true):
+    def log_prob(self, y_pred, y_l, y_true, y_size):
         self.m, self.v = self.gp(y_pred, y_l)
-        loss = tf.math.reduce_mean((y_true-self.m)**2/self.v)
-        loss += tf.math.reduce_mean(tf.math.log(self.v))
+        self.sample = self.gp.sample(y_size)
+        loss = -self.gp.log_prob( y_true )
         loss += tf.math.reduce_mean(self.L.losses)
         return loss
 
@@ -538,7 +571,7 @@ class ANN_dropout(keras.Model):
         self.x_l = x_l
         self.gp = GPR(x_l)
         
-        # l1 = tf.keras.regularizers.l1(1e-4)
+        l1 = tf.keras.regularizers.l2(1e-4)
         
         # Parameters, w, b, input_noise
         # Linear weights
@@ -553,7 +586,7 @@ class ANN_dropout(keras.Model):
                 )
         )
         self.L.add(
-            tf.keras.layers.Dropout(0.1)
+            tf.keras.layers.Dropout(0.2)
         )
         self.L.add(
             tf.keras.layers.Dense(
@@ -565,7 +598,7 @@ class ANN_dropout(keras.Model):
                 )
         )
         self.L.add(
-            tf.keras.layers.Dropout(0.1)
+            tf.keras.layers.Dropout(0.3)
         )
         self.L.add(
             tf.keras.layers.Dense(
@@ -574,12 +607,12 @@ class ANN_dropout(keras.Model):
                 )
         )
     
-    def sample(self, X_d, training = True):
-        eps = 1e-2*tf.random.normal(shape=(50, self.input_dim, self.n_features), dtype='float64')
+    def monte_carlo_sample(self, X_d, training = True):
+        eps = 1e-2*tf.random.normal(shape=(50, self.input_dim*self.n_features), dtype='float64')
         z = X_d + eps
         return self.L(z, training=training)
         
-    def call(self, X_d):
+    def call(self, X_d, training=True):
         r"""
         Produces an estimate x for the latent variable x = f(X) + noise
         With that estimate x, projects to the output space m = Lx + var
@@ -588,17 +621,13 @@ class ANN_dropout(keras.Model):
         """
         
         ## ANN Map
-        x_samp = self.sample(tf.cast(tf.reshape(X_d, [1,-1]), dtype='float64'))
-        x = tf.math.reduce_mean(x_samp, axis=0)
-        x = tf.reshape(x, (-1, 1))
-        self.noise = tf.math.reduce_mean( (x - x_samp)**2, axis=0 )
-        self.noise = tf.reshape(self.noise, (-1,))
+        x = tf.reshape(self.L(tf.cast(tf.reshape(X_d, [1,-1]), dtype='float64'), training=True), (-1, ))
         return x
     
-    def log_prob(self, y_pred, y_l, y_true):
-        self.m, self.v = self.gp(y_pred, y_l, self.noise)
-        loss = tf.math.reduce_mean((y_true-self.m)**2/self.v)
-        loss += tf.math.reduce_mean(tf.math.log(self.v))
+    def log_prob(self, y_pred, y_l, y_true, y_size):
+        self.m, self.v = self.gp(y_pred, y_l)
+        self.sample = self.gp.sample(y_size)
+        loss = -self.gp.log_prob( y_true )
         loss += tf.math.reduce_mean(self.L.losses)
         return loss
     
@@ -630,7 +659,7 @@ class ANN_distribution(keras.Model):
     
     """
     def __init__(self, input_dim, n_features, x_l, dtype='float64', **kwargs):
-        super(ANN_distribution, self).__init__(name='dropout_neural_network', dtype='float64', **kwargs)
+        super(ANN_distribution, self).__init__(name='variational_neural_network', dtype='float64', **kwargs)
         
         # Sizes
         self.input_dim = input_dim
@@ -640,8 +669,8 @@ class ANN_distribution(keras.Model):
         self.x_l = x_l
         self.gp = GPR(x_l)
         
-        # l1 = tf.keras.regularizers.l1(1e-4)
-        
+        l1 = tf.keras.regularizers.l1(5e-2)
+        l2 = tf.keras.regularizers.l2(5e-3)
         # Parameters, w, b, input_noise
         # Linear weights
         self.L = tf.keras.Sequential()
@@ -654,26 +683,32 @@ class ANN_distribution(keras.Model):
                 bias_regularizer = l1
                 )
         )
-
         self.L.add(
             tf.keras.layers.Dense(
                 self.input_dim, 
                 input_shape=(self.input_dim,),
                 activation='relu',
-                kernel_regularizer = l1,
-                bias_regularizer = l1
+                kernel_regularizer = l2,
+                bias_regularizer = l2
                 )
         )
-
         self.L.add(
             tf.keras.layers.Dense(
                 2*self.input_dim, 
                 input_shape=(self.input_dim,),
+                # activation='relu',
+                kernel_regularizer = l2,
+                bias_regularizer = l2,
                 )
+        )
+        self.L.add(
+            tfp.layers.DistributionLambda(
+                lambda t: tfd.MultivariateNormalDiag(loc=t[..., :self.input_dim],
+                           scale_diag= np.float64(1e-8) + tf.math.softplus(t[...,self.input_dim:]))),
         )
     
         
-    def call(self, X_d):
+    def call(self, X_d, training=True):
         r"""
         Produces an estimate x for the latent variable x = f(X) + noise
         With that estimate x, projects to the output space m = Lx + var
@@ -682,17 +717,17 @@ class ANN_distribution(keras.Model):
         """
         
         ## ANN Map
-        x, x_noise = tf.split(self.L(tf.cast(tf.reshape(X_d, [1,-1]), dtype='float64')), 
-                        num_or_size_splits = 2, axis=1)
-        x = tf.reshape(x, (-1, 1))
-        self.noise = tf.reshape( tf.nn.softplus(x_noise), (-1,))
+        self.x_dist = self.L(tf.cast(tf.reshape(X_d, [1,-1]), dtype='float64'), training=training)
+        x = self.x_dist.sample()
+
+        x = tf.reshape(x, (-1,))
+        self.noise = tf.reshape( self.x_dist.variance(), (-1,))
         return x
     
-    def log_prob(self, y_pred, y_l, y_true):
-        self.m, self.v = self.gp(y_pred, y_l, self.noise)
-        loss = tf.math.reduce_mean((y_true-self.m)**2/self.v)
-        loss += tf.math.reduce_mean(-2*tf.math.log(self.noise) + 2*self.noise)
-        loss += tf.math.reduce_mean(tf.math.log(self.v))
+    def log_prob(self, y_pred, y_l, y_true, y_size):
+        self.m, self.v = self.gp(y_pred, y_l)
+        self.sample = self.gp.sample(y_size)
+        loss = -self.gp.log_prob( y_true )
         loss += tf.math.reduce_mean(self.L.losses)
         return loss
 
@@ -737,9 +772,6 @@ class Flipout(keras.Model):
         self.gp = GPR(x_l)
         
         l1 = tf.keras.regularizers.l1(1e-3)
-        # Parameters, w, b, input_noise
-        # Linear weights
-        num_filters = 8
         self.L = tf.keras.Sequential(
             [
                 tf.keras.layers.InputLayer(input_shape=(self.input_dim, self.n_features)),
@@ -757,8 +789,8 @@ class Flipout(keras.Model):
         )
  
     
-    def sample(self, X_d, training = True):
-        eps = 1e-2*tf.random.normal(shape=(50, self.input_dim, self.n_features), dtype='float64')
+    def funcsample(self, X_d, training = True):
+        eps = 1e-3*tf.random.normal(shape=(50, self.input_dim, self.n_features), dtype='float64')
         z = X_d + eps
         return self.L(z, training=training)
                 
@@ -771,18 +803,20 @@ class Flipout(keras.Model):
         """
         
         ## ANN Map
-        x_samp = self.sample(tf.cast(tf.reshape(X_d, [1, self.input_dim, self.n_features]), dtype='float64'), training=training)
+        x_samp = self.funcsample(tf.cast(tf.reshape(X_d, 
+                                                    [1, self.input_dim, self.n_features]), 
+                                    dtype='float64'), 
+                                 training=training)
         x = tf.reduce_mean(x_samp, axis=0)
-        self.noise = tf.reshape(tf.reduce_mean( (x - x_samp)**2, axis=0), (-1,))
-        x = tf.reshape(x, (-1, 1))
+        self.noise = tf.reduce_mean( (x - x_samp)**2, axis=0)
+        x = tf.reshape(x, (-1, ))
         return x
     
-    def log_prob(self, y_pred, y_l, y_true):
-        self.m, self.v = self.gp(y_pred, y_l, self.noise)
-        loss = tf.math.reduce_mean((y_true-self.m)**2/self.v)
-        loss += tf.reduce_mean(self.L.losses)
-        loss += tf.math.reduce_mean(tf.math.log(self.v))
-        loss += tf.math.reduce_mean(-2*tf.math.log(self.noise) + 2*self.noise)
+    def log_prob(self, y_pred, y_l, y_true, y_size):
+        self.m, self.v = self.gp(y_pred, y_l)
+        self.sample = self.gp.sample(y_size)
+        loss = -self.gp.log_prob( y_true )
+        loss += tf.math.reduce_mean(self.L.losses)
         return loss
 
 
@@ -823,7 +857,7 @@ class VAE(keras.Model):
         
         # Initialize grid and gaussian process        
         self.x_l = x_l
-        self.gp = GPR(x_l, input_noise = False)
+        self.gp = GPR(x_l)
         
         
         # Parameters, w, b, input_noise
@@ -850,7 +884,7 @@ class VAE(keras.Model):
  
 
     @tf.function
-    def sample(self, mean, logvar, eps=None):
+    def funcsample(self, mean, logvar, eps=None):
         if eps is None:
             eps = tf.random.normal(shape=(100, self.latent_dim), dtype='float64')
         return self.regressor(eps * tf.exp(logvar*0.5) + mean, training=True)
@@ -881,20 +915,21 @@ class VAE(keras.Model):
         self.mean, self.logvar = self.encode(self.X_d)
         self.z = self.reparameterize(self.mean, self.logvar)
         self.xp = self.decode(self.z)
-        x_samp = self.sample(self.mean, self.logvar)
+        x_samp = self.funcsample(self.mean, self.logvar)
         x = tf.reduce_mean(x_samp, axis=0)
         self.noise = tf.reshape(tf.reduce_mean( (x_samp - x)**2, axis=0 ), (-1,))
-        x = tf.reshape(x, (-1, 1))
+        x = tf.reshape(x, (-1, ))
         return x
     
-    def log_prob(self, y_pred, y_l, y_true):
-        self.m, self.v = self.gp(y_pred, y_l, self.noise)
-        loss = tf.math.reduce_mean((y_true-self.m)**2/self.v)
+    def log_prob(self, y_pred, y_l, y_true, y_size):
+        self.m, self.v = self.gp(y_pred, y_l)
+        self.sample = self.gp.sample(y_size)
+        loss = -self.gp.log_prob( y_true )
         loss += tf.math.reduce_mean((self.X_d - self.xp)**2)
-        loss += tf.math.reduce_mean(tf.math.log(self.v))
         loss += tf.math.reduce_mean( self.z**2 )
         loss -= tf.math.reduce_mean( (self.z - self.mean)**2*tf.exp(-self.logvar) + self.logvar )
         return loss
+
 
 class CNN(keras.Model):
     r"""
@@ -924,25 +959,25 @@ class CNN(keras.Model):
     
     
     """
-    def __init__(self, nlat, nlon, n_channels, x_l, dtype='float64', **kwargs):
+    def __init__(self, nlat, nlon, n_features, x_l, dtype='float64', **kwargs):
         super(CNN, self).__init__(name='convolutional_neural_network', dtype='float64', **kwargs)
         
         # Sizes
         self.nlat = nlat
         self.nlon = nlon
-        self.n_channels = n_channels
-        
+        self.n_features = n_features
+        self.input_dim = nlat*nlon
         # Initialize grid and gaussian process        
         self.x_l = x_l
         self.gp = GPR(x_l)
         
-        
+        l1 = tf.keras.regularizers.l1(1e-2)
         # Parameters, w, b, input_noise
         # Linear weights
         num_filters = 8
         self.L = tf.keras.Sequential(
             [
-                tf.keras.layers.InputLayer(input_shape=(self.nlat, self.nlon, self.n_channels)),
+                tf.keras.layers.InputLayer(input_shape=(self.nlat, self.nlon, self.n_features)),
                 tf.keras.layers.Conv2D(filters = 16, kernel_size = 9, activation='relu', padding='same'),
                 tf.keras.layers.Conv2D(filters = 16, kernel_size = 9, activation='relu', padding='same'),
                 tf.keras.layers.Conv2D(filters=16, kernel_size=5, activation='relu', strides=2),
@@ -953,7 +988,8 @@ class CNN(keras.Model):
                 tf.keras.layers.Conv2D(filters = 64, kernel_size = 9, activation='relu', padding='same'),
                 tf.keras.layers.Conv2D(filters=64, kernel_size=5, activation='relu', strides=2),
                 tf.keras.layers.Flatten(),
-                tf.keras.layers.Dense(self.nlat*self.nlon),
+                tf.keras.layers.Dense(self.input_dim, 
+                                       ),
             ]
         )
  
@@ -968,207 +1004,232 @@ class CNN(keras.Model):
         """
         
         ## ANN Map
-        x = self.L(tf.cast(tf.reshape(X_d, [1, self.nlat, self.nlon, self.n_channels]), dtype='float64'))
-        x = tf.reshape(x, (-1, 1))
+        x = self.L(tf.cast(tf.reshape(X_d, [1, self.nlat, self.nlon, self.n_features]), dtype='float64'))
+        x = tf.reshape(x, (-1, ))
         return x
     
-    def log_prob(self, y_pred, y_l, y_true):
+    def log_prob(self, y_pred, y_l, y_true, y_size):
         self.m, self.v = self.gp(y_pred, y_l)
-        loss = tf.math.reduce_mean((y_true-self.m)**2/self.v)
-        loss += tf.math.reduce_mean(tf.math.log(self.v))
+        self.sample = self.gp.sample(y_size)
+        loss = -self.gp.log_prob( y_true )
+        # loss += tf.math.reduce_mean(self.L.losses)
         return loss
 
 
-class ResnetIdentityBlock(keras.Model):
-    def __init__(self, kernel_size, filters, identity=False, name='ResnetBlock'):
-        super(ResnetIdentityBlock, self).__init__(name=name, dtype='float64')
-        filters1, filters2, filters3 = filters
-        self.identity = identity
-        self.conv2a = tf.keras.layers.Conv2D(filters1, (1,1))
-        self.bn2a = tf.keras.layers.LayerNormalization()
+# class ResnetIdentityBlock(keras.Model):
+#     def __init__(self, kernel_size, filters, identity=False, name='ResnetBlock'):
+#         super(ResnetIdentityBlock, self).__init__(name=name, dtype='float64')
+#         filters1, filters2, filters3 = filters
+#         self.identity = identity
+#         self.conv2a = tf.keras.layers.Conv2D(filters1, (1,1))
+#         self.bn2a = tf.keras.layers.LayerNormalization()
 
-        self.conv2b = tf.keras.layers.Conv2D(filters2, kernel_size, padding='same')
-        self.bn2b = tf.keras.layers.LayerNormalization()
+#         self.conv2b = tf.keras.layers.Conv2D(filters2, kernel_size, padding='same')
+#         self.bn2b = tf.keras.layers.LayerNormalization()
 
-        self.conv2c = tf.keras.layers.Conv2D(filters3, (1,1))
-        self.bn2c = tf.keras.layers.LayerNormalization()
+#         self.conv2c = tf.keras.layers.Conv2D(filters3, (1,1))
+#         self.bn2c = tf.keras.layers.LayerNormalization()
 
-        self.convid = tf.keras.layers.Conv2D(filters3, (1,1))
+#         self.convid = tf.keras.layers.Conv2D(filters3, (1,1))
     
-    def call(self, input_tensor, training=False):
-        x = self.conv2a(input_tensor)
-        x = self.bn2a(x, training = training)
-        x = tf.nn.relu(x)
+#     def call(self, input_tensor, training=False):
+#         x = self.conv2a(input_tensor)
+#         x = self.bn2a(x, training = training)
+#         x = tf.nn.relu(x)
 
-        x = self.conv2b(x)
-        x = self.bn2b(x, training = training)
-        x = tf.nn.relu(x)
+#         x = self.conv2b(x)
+#         x = self.bn2b(x, training = training)
+#         x = tf.nn.relu(x)
 
-        x = self.conv2c(x)
-        x = self.bn2c(x, training = training)
-        if self.identity:
-            x += input_tensor
-        else:
-            x += self.convid(input_tensor, training=training)
-        return tf.nn.relu(x)
+#         x = self.conv2c(x)
+#         x = self.bn2c(x, training = training)
+#         if self.identity:
+#             x += input_tensor
+#         else:
+#             x += self.convid(input_tensor, training=training)
+#         return tf.nn.relu(x)
 
-class Resnet(keras.Model):
-    r"""
-    Implements a residual neural network for the relationship x = f(X) + b + noise, 
-    where X = (nlat, nlon, n_channels) with training model y = Lx + V, where L and V 
-    are obtained via GP regression.
+# class Resnet(keras.Model):
+#     r"""
+#     Implements a residual neural network for the relationship x = f(X) + b + noise, 
+#     where X = (nlat, nlon, n_channels) with training model y = Lx + V, where L and V 
+#     are obtained via GP regression.
     
-    Input arguments - nlon, number of rows (longitude) of X
-                    - nlat, number of columns (latitude) of X
-                    - n_channels, number of columns of X
-                    - x_l,  locations of inputs, shape (input_dim, 2)
-                            columns house (lon,lat) coordinates respectively.
-                    - y_l, locations of training data
-                    - y_d, training data values
+#     Input arguments - nlon, number of rows (longitude) of X
+#                     - nlat, number of columns (latitude) of X
+#                     - n_channels, number of columns of X
+#                     - x_l,  locations of inputs, shape (input_dim, 2)
+#                             columns house (lon,lat) coordinates respectively.
+#                     - y_l, locations of training data
+#                     - y_d, training data values
                             
-    Output arguments - x, estimate of x = f(X) + noise
-                     - m, mean estimate of m = Lx + V
-                     - v, diagonal variance of gp covariance V
+#     Output arguments - x, estimate of x = f(X) + noise
+#                      - m, mean estimate of m = Lx + V
+#                      - v, diagonal variance of gp covariance V
                      
-    Parameters       - w_i, linear weight matrix, shape (input_dim, n_features)
-                     - b_i, bias, shape (input_dim, )
+#     Parameters       - w_i, linear weight matrix, shape (input_dim, n_features)
+#                      - b_i, bias, shape (input_dim, )
     
-    Inherited Parameters - input_noise, input-dependent noise estimate, shape (input_dim,)
-                         gives estimate of variances 
-                         - .gp.amplitude, kernel amplitude
-                         - .gp.length_Scale, kernel length scale
+#     Inherited Parameters - input_noise, input-dependent noise estimate, shape (input_dim,)
+#                          gives estimate of variances 
+#                          - .gp.amplitude, kernel amplitude
+#                          - .gp.length_Scale, kernel length scale
     
     
-    """
-    def __init__(self, nlat, nlon, n_channels, x_l, dtype='float64', **kwargs):
-        super(Resnet, self).__init__(name='residual_neural_network', dtype='float64', **kwargs)
+#     """
+#     def __init__(self, nlat, nlon, n_channels, x_l, dtype='float64', **kwargs):
+#         super(Resnet, self).__init__(name='residual_neural_network', dtype='float64', **kwargs)
         
-        # Sizes
-        self.nlat = nlat
-        self.nlon = nlon
-        self.n_channels = n_channels
+#         # Sizes
+#         self.nlat = nlat
+#         self.nlon = nlon
+#         self.n_channels = n_channels
         
-        # Initialize grid and gaussian process        
-        self.x_l = x_l
-        self.gp = GPR(x_l)
+#         # Initialize grid and gaussian process        
+#         self.x_l = x_l
+#         self.gp = GPR(x_l)
         
         
-        # Parameters, w, b, input_noise
-        # Linear weights
-        self.L = tf.keras.Sequential(
-            [
-                tf.keras.layers.InputLayer(input_shape = (self.nlat, self.nlon, self.n_channels)),
-                tf.keras.layers.Conv2D(16, (9, 9), activation='relu', padding = 'same'),
-                tf.keras.layers.Conv2D(16, (5, 5), strides = 2, activation='relu'),
+#         # Parameters, w, b, input_noise
+#         # Linear weights
+#         self.L = tf.keras.Sequential(
+#             [
+#                 tf.keras.layers.InputLayer(input_shape = (self.nlat, self.nlon, self.n_channels)),
+#                 tf.keras.layers.Conv2D(16, (9, 9), activation='relu', padding = 'same'),
+#                 tf.keras.layers.Conv2D(16, (5, 5), strides = 2, activation='relu'),
                 
-                ResnetIdentityBlock(9, (16, 16, 16), name='resnet1'),
-                ResnetIdentityBlock(9, (16, 16, 16), name='resnet2'),
-                ResnetIdentityBlock(9, (16, 16, 16), name='resnet3'),
-                tf.keras.layers.Conv2D(16, (5, 5), strides = 2, activation='relu'),
-                ResnetIdentityBlock(9, (2*16, 2*16, 2*16), identity=False, name='resnet4'),
-                ResnetIdentityBlock(9, (2*16, 2*16, 2*16), name='resnet5'),
-                ResnetIdentityBlock(9, (2*16, 2*16, 2*16), name='resnet6'),
-                tf.keras.layers.Conv2D(2*16, (5, 5), strides = 2, activation='relu'),
-                ResnetIdentityBlock(9, (4*16, 4*16, 4*16), identity=False, name='resnet7'),
-                ResnetIdentityBlock(9, (4*16, 4*16, 4*16), name='resnet8'),
-                ResnetIdentityBlock(9, (4*16, 4*16, 4*16), name='resnet9'),
-                # tf.keras.layers.Conv2D(self.nlat, (5, 5), strides = 2, activation='relu'),              
-                tf.keras.layers.Flatten(),
-                tf.keras.layers.Dense(self.nlat*self.nlon, activation = 'relu',
-                    kernel_regularizer = tf.keras.regularizers.l2(1e-3) ),
-                tf.keras.layers.Dense(self.nlat*self.nlon,kernel_regularizer = tf.keras.regularizers.l2(1e-3) ),
-            ]
-        )               
-    def call(self, X_d, training=True):
-        r"""
-        Produces an estimate x for the latent variable x = f(X) + noise
-        With that estimate x, projects to the output space m = Lx + var
-        where the loss is calculated as l = (y_d - mean)(y_d - mean)/var
-        outputs x, mean and var
-        """
+#                 ResnetIdentityBlock(9, (16, 16, 16), name='resnet1'),
+#                 ResnetIdentityBlock(9, (16, 16, 16), name='resnet2'),
+#                 ResnetIdentityBlock(9, (16, 16, 16), name='resnet3'),
+#                 tf.keras.layers.Conv2D(16, (5, 5), strides = 2, activation='relu'),
+#                 ResnetIdentityBlock(9, (2*16, 2*16, 2*16), identity=False, name='resnet4'),
+#                 ResnetIdentityBlock(9, (2*16, 2*16, 2*16), name='resnet5'),
+#                 ResnetIdentityBlock(9, (2*16, 2*16, 2*16), name='resnet6'),
+#                 tf.keras.layers.Conv2D(2*16, (5, 5), strides = 2, activation='relu'),
+#                 ResnetIdentityBlock(9, (4*16, 4*16, 4*16), identity=False, name='resnet7'),
+#                 ResnetIdentityBlock(9, (4*16, 4*16, 4*16), name='resnet8'),
+#                 ResnetIdentityBlock(9, (4*16, 4*16, 4*16), name='resnet9'),
+#                 # tf.keras.layers.Conv2D(self.nlat, (5, 5), strides = 2, activation='relu'),              
+#                 tf.keras.layers.Flatten(),
+#                 tf.keras.layers.Dense(self.nlat*self.nlon, activation = 'relu',
+#                     kernel_regularizer = tf.keras.regularizers.l2(1e-3) ),
+#                 tf.keras.layers.Dense(self.nlat*self.nlon,kernel_regularizer = tf.keras.regularizers.l2(1e-3) ),
+#             ]
+#         )               
+#     def call(self, X_d, training=True):
+#         r"""
+#         Produces an estimate x for the latent variable x = f(X) + noise
+#         With that estimate x, projects to the output space m = Lx + var
+#         where the loss is calculated as l = (y_d - mean)(y_d - mean)/var
+#         outputs x, mean and var
+#         """
         
-        ## ANN Map
-        x = self.L(tf.cast(tf.reshape(X_d, [1, self.nlat, self.nlon, self.n_channels]), dtype='float64'), training)
-        x = tf.reshape(x, (-1, 1))
-        return x
+#         ## ANN Map
+#         x = self.L(tf.cast(tf.reshape(X_d, [1, self.nlat, self.nlon, self.n_channels]), dtype='float64'), training)
+#         x = tf.reshape(x, (-1, 1))
+#         return x
     
-    def log_prob(self, y_pred, y_l, y_true):
-        self.m, self.v = self.gp(y_pred, y_l)
-        loss = tf.math.reduce_mean((y_true-self.m)**2/self.v)
-        loss += tf.math.reduce_mean(self.L.losses)
-        loss += tf.math.reduce_mean(tf.math.log(self.v))
-        return loss
+#     def log_prob(self, y_pred, y_l, y_true):
+#         self.m, self.v = self.gp(y_pred, y_l)
+#         loss = tf.math.reduce_mean((y_true-self.m)**2/self.v)
+#         loss += tf.math.reduce_mean(self.L.losses)
+#         loss += tf.math.reduce_mean(tf.math.log(self.v))
+#         return loss
 
 ####################################################################################
 ########################### Training Proceedure ####################################
 ####################################################################################
 from scipy.stats import pearsonr
+@tf.function(autograph=False)
+def batch_train(optimizer, model, X_d_batch, y_d_batch, y_l_batch, y_size, mini_batch_size, n_steps_train):
+    loss = 0.0
+    for j in range(mini_batch_size):
+        with tf.GradientTape() as dtape:
+            X_d = X_d_batch[j]
+            y_d = y_d_batch[j]
+            y_l = y_l_batch[j]
+            dtape.watch(model.trainable_variables)
+            x = model(X_d + tf.random.normal( (X_d.shape[0], 3), stddev=1e-4, dtype=tf.float64) )
+            loss += mini_batch_size*model.log_prob(x, y_l, y_d, y_size[j])/n_steps_train
+            
+    # Apply gradients to model parameters
+    grads = dtape.gradient(loss, model.trainable_variables)
+    optimizer.apply_gradients(zip(grads, model.trainable_variables))
+
+def train_minibatch(dataset, model, mini_batch_size, optimizer):
+    n_steps_train = dataset.i_train.size
+    batch_index = np.random.permutation(n_steps_train)
+    num_minibatch = np.ceil(n_steps_train / mini_batch_size).astype(int)
+    i = 0
+    for batch in range(num_minibatch):
+        X_d_batch = np.zeros((mini_batch_size, model.input_dim, model.n_features))
+        y_d_batch = []
+        y_l_batch1 = []
+        y_l_batch2 = []
+        y_size = np.zeros(mini_batch_size, dtype=np.int64)
+        for j in range(mini_batch_size):
+            X_d, X_l, y_d, y_l = dataset.get_index(dataset.i_train[batch_index[i]])
+            X_d_batch[j] = X_d
+            y_d_batch.append(y_d.reshape(-1,))
+            y_l_batch1.append(y_l[:,0])
+            y_l_batch2.append(y_l[:,1])
+            y_size[j] = y_d.size
+            i+=1
+        X_d_batch = tf.cast(X_d_batch, dtype='float64')
+        y_d_batch = tf.ragged.constant(y_d_batch, ragged_rank=1)
+        y_l_batch = tf.stack((tf.ragged.constant(y_l_batch1, ragged_rank=1),
+                            tf.ragged.constant(y_l_batch2, ragged_rank=1)), axis=-1)
+        batch_train(optimizer, model, X_d_batch, y_d_batch, y_l_batch, y_size, mini_batch_size, n_steps_train)
+            
+    
+
 def train_func(dataset, model, epochs = 500, print_epoch = 100, lr = 0.001, num_early_stopping = 500, mini_batch_size=10):
-    optimizer = tf.keras.optimizers.Adam(learning_rate=lr)
-    losses = np.zeros((epochs,6))
-    variables = np.zeros((epochs,6))
+    losses = np.zeros((epochs,7))
     
     n_steps_train = dataset.i_train.size
     n_steps_test = dataset.i_test.size
 
+    optimizer = tf.keras.optimizers.Adam(learning_rate=lr)
+
     # Implement early_stopping
     early_stopping_counter = 0
-    early_stopping_min_value = 1e6
+    early_stopping_min_value = 0
     # Iterate over epochs.
-    var = dataset.calc_covariance(dataset.i_train)
     for epoch in range(epochs):
-        loss = 0
-        batch = np.random.permutation(n_steps_train)
-
-        for steps in range(1, n_steps_train+1):
-            X_d, X_l, y_d, y_l = dataset.get_index(dataset.i_train[batch[steps-1]])
-            with tf.GradientTape() as dtape:
-                dtape.watch(model.trainable_variables[2:])
-                x = model(X_d.reshape(-1,3) + 1e-2*np.random.randn(X_d.shape[0], 3))
-                loss += model.log_prob(x, y_l.reshape(-1,2), y_d)/mini_batch_size 
-
-            
-            # Stores losses and variables per epoch for troubleshooting
-            losses[epoch, 0] += tf.math.reduce_mean( (y_d-model.m)*(y_d-model.m))/n_steps_train
-            losses[epoch, 1] += np.mean( (y_d < (model.m+np.sqrt(model.v) )) & 
-                                          (y_d > (model.m-np.sqrt(model.v) )) )/n_steps_train
-            losses[epoch, 2] += pearsonr(model.m.numpy().flatten(), y_d.flatten())[0]/n_steps_train
-            variables[epoch, 0] += model.gp.amplitude.numpy()/n_steps_train
-            variables[epoch, 1] += model.gp.length_scale.numpy()/n_steps_train
-            variables[epoch, 2] += tf.math.reduce_mean(tf.exp(model.gp.input_noise)).numpy()/n_steps_train
-            variables[epoch, 4] += np.linalg.norm(model.m.numpy())/n_steps_train
-            variables[epoch, 3] += np.linalg.norm(model.v.numpy())/n_steps_train
-            variables[epoch, 5] += np.linalg.norm(x.numpy())/n_steps_train
-
-            if steps % mini_batch_size == 0:
-                # Apply gradients to model parameters
-                grads = dtape.gradient(loss, model.trainable_variables[2:])
-                optimizer.apply_gradients(zip(grads, model.trainable_variables[2:]))
-                loss = 0
-
         
+        losses[epoch, 0] = train_minibatch(dataset, model, mini_batch_size, optimizer)
+        
+        for steps in np.random.choice(dataset.i_train, size = 20, replace = False):
+            X_d, X_l, y_d, y_l = dataset.get_index(steps)     
+            x = model(X_d)
+            loss = model.log_prob(x, y_l.reshape(-1,2), y_d, y_d.size) 
+            losses[epoch, 1] += tf.math.reduce_mean( (y_d-model.sample)**2)/20.0
+            losses[epoch, 2] += np.mean( (y_d < (model.m+np.sqrt(model.v) )) & 
+                                          (y_d > (model.m-np.sqrt(model.v) )) )/20.0
+            losses[epoch, 3] += pearsonr(model.sample.numpy().flatten(), y_d.flatten())[0] / 20.0
+                
         for steps in range(n_steps_test):
             X_d, X_l, y_d, y_l = dataset.get_index(dataset.i_test[steps])     
             x = model(X_d)
-            loss = model.log_prob(x, y_l.reshape(-1,2), y_d) 
-            losses[epoch, 3] += tf.math.reduce_mean( (y_d-model.m)*(y_d-model.m))/n_steps_test
-            losses[epoch, 4] += np.mean( (y_d < (model.m+np.sqrt(model.v) )) & 
+            loss = model.log_prob(x, y_l.reshape(-1,2), y_d, y_d.size) 
+            losses[epoch, 4] += tf.math.reduce_mean( (y_d-model.sample)**2)/n_steps_test
+            losses[epoch, 5] += np.mean( (y_d < (model.m+np.sqrt(model.v) )) & 
                                           (y_d > (model.m-np.sqrt(model.v) )) )/n_steps_test
-            losses[epoch, 5] += pearsonr(model.m.numpy().flatten(), y_d.flatten())[0] / n_steps_test
+            losses[epoch, 6] += pearsonr(model.sample.numpy().flatten(), y_d.flatten())[0] / n_steps_test
 
 
         if epoch % print_epoch == 0:
-            print('Epoch', epoch,  ' ', 'mean train loss = {:2.3f}'.format(losses[epoch,0]),
-                                        'train Prob = {:.2f}'.format(losses[epoch,1]),
-                                        'train correlation = {:.2f}'.format(losses[epoch,2]),
+            print('Epoch', epoch,  ' ', 'mean train loss = {:2.3f}'.format(losses[epoch,1]),
+                                        'train Prob = {:.2f}'.format(losses[epoch,2]),
+                                        'train correlation = {:.2f}'.format(losses[epoch,3]),
                                         '\n \t',
-                                        'mean test loss = {:2.3f}'.format(losses[epoch, 3]), 
-                                        'test Prob = {:.2f}'.format(losses[epoch,4]),
-                                         'test correlation = {:.2f}'.format(losses[epoch,5]),
+                                        'mean test loss = {:2.3f}'.format(losses[epoch, 4]), 
+                                        'test Prob = {:.2f}'.format(losses[epoch,5]),
+                                         'test correlation = {:.2f}'.format(losses[epoch,6]),
                  )
         
-        if losses[epoch,3] < early_stopping_min_value:
-            early_stopping_min_value = losses[epoch, 3]
+        if losses[epoch,6] > early_stopping_min_value:
+            early_stopping_min_value = losses[epoch, 6]
             early_stopping_counter = 0
             model.save_weights('./saved_model/temp/temp_model_save')
         else:
@@ -1178,7 +1239,123 @@ def train_func(dataset, model, epochs = 500, print_epoch = 100, lr = 0.001, num_
             break
     model.load_weights('./saved_model/temp/temp_model_save')
     model.save_weights('./saved_model/'+model.name+'{:.3f}'.format(early_stopping_min_value))
-    return losses[:epoch, :], variables[:epoch, :]
+    return losses[:epoch, :]
+
+def hmc(dataset, model, epochs = 500, print_epoch = 100, lr = 0.001, num_early_stopping = 500, mini_batch_size=10):
+    losses = np.zeros((epochs,7))
+    
+    n_steps_train = dataset.i_train.size
+    n_steps_test = dataset.i_test.size
+
+    optimizer = tf.keras.optimizers.Adam(learning_rate=lr)
+
+    # Implement early_stopping
+    early_stopping_counter = 0
+    early_stopping_min_value = 0
+    # Iterate over epochs.
+    L = 10
+    for epoch in range(epochs):
+        q = model.trainable_variables.copy()
+        for j in range(len(q)):
+            q[j] = tf.identity(model.trainable_variables[j])
+        current_U = U(dataset, model)[0]/model.input_dim
+        print('Current U', current_U)
+        p = model.trainable_variables.copy()
+        current_P = 0.0
+        for j in range(len(p)):
+            p[j] = tf.random.normal(p[j].shape, stddev = 1e-4, dtype='float64')
+            current_P += tf.math.reduce_sum(p[j]**2)/2.0
+        print('Current P', current_P)
+
+        grads = U(dataset, model)[1]
+        for j in range(len(p)):
+            p[j] = p[j] - lr * grads[j] / 2.0
+        for i in range(L):
+            for j in range(len(p)):
+                model.trainable_variables[j].assign(
+                    model.trainable_variables[j] + lr * p[j] 
+                )
+
+            if i != (L-1):
+                grads = U(dataset, model)[1]
+                for j in range(len(p)):
+                    p[j] = p[j] - lr * grads[j]
+        
+        grads = U(dataset, model)[1]
+        proposed_P = 0.0
+        for j in range(len(p)):
+            p[j] = p[j] - lr * grads[j] / 2.0
+            p[j] = -p[j]
+            proposed_P += tf.math.reduce_sum(p[j]**2)/2.0
+
+        proposed_U = U(dataset, model)[0]/model.input_dim
+        print('Proposed U', proposed_U)
+        print('Proposed P', proposed_P)
+        delta = (current_U - proposed_U) + (current_P - proposed_P)
+        print('Delta: ', delta)
+        alpha = np.log(np.random.random())
+        print('alpha', alpha)
+        if alpha > delta:
+            print('Reject!')
+            for j in range(len(q)):
+                model.trainable_variables[j].assign(
+                    q[j]
+                )
+
+
+        
+        for steps in np.random.choice(dataset.i_train, size = 20, replace = False):
+            X_d, X_l, y_d, y_l = dataset.get_index(steps)     
+            x = model(X_d)
+            loss = model.log_prob(x, y_l.reshape(-1,2), y_d) 
+            losses[epoch, 1] += tf.math.reduce_mean( (y_d-model.sample)**2)/20.0
+            losses[epoch, 2] += np.mean( (y_d < (model.m+np.sqrt(model.v) )) & 
+                                          (y_d > (model.m-np.sqrt(model.v) )) )/20.0
+            losses[epoch, 3] += pearsonr(model.sample.numpy().flatten(), y_d.flatten())[0] / 20.0
+                
+        for steps in range(n_steps_test):
+            X_d, X_l, y_d, y_l = dataset.get_index(dataset.i_test[steps])     
+            x = model(X_d)
+            loss = model.log_prob(x, y_l.reshape(-1,2), y_d) 
+            losses[epoch, 4] += tf.math.reduce_mean( (y_d-model.sample)**2)/n_steps_test
+            losses[epoch, 5] += np.mean( (y_d < (model.m+np.sqrt(model.v) )) & 
+                                          (y_d > (model.m-np.sqrt(model.v) )) )/n_steps_test
+            losses[epoch, 6] += pearsonr(model.sample.numpy().flatten(), y_d.flatten())[0] / n_steps_test
+
+
+        if epoch % print_epoch == 0:
+            print('Epoch', epoch,  ' ', 'mean train loss = {:2.3f}'.format(losses[epoch,1]),
+                                        'train Prob = {:.2f}'.format(losses[epoch,2]),
+                                        'train correlation = {:.2f}'.format(losses[epoch,3]),
+                                        '\n \t',
+                                        'mean test loss = {:2.3f}'.format(losses[epoch, 4]), 
+                                        'test Prob = {:.2f}'.format(losses[epoch,5]),
+                                         'test correlation = {:.2f}'.format(losses[epoch,6]),
+                 )
+        
+        if losses[epoch,6] > early_stopping_min_value:
+            early_stopping_min_value = losses[epoch, 6]
+            early_stopping_counter = 0
+            model.save_weights('./saved_model/temp/temp_model_save')
+        else:
+            early_stopping_counter += 1
+        if early_stopping_counter > num_early_stopping:
+            print('Early Stopping at iteration {:d}'.format(epoch))
+            break
+    model.load_weights('./saved_model/temp/temp_model_save')
+    model.save_weights('./saved_model/'+model.name+'{:.3f}'.format(early_stopping_min_value))
+    return losses[:epoch, :]
+
+def U(dataset, model):
+    loss = 0.0
+    for index in np.random.choice(dataset.i_train, size = 25, replace= False):
+            X_d, X_l, y_d, y_l = dataset.get_index(index)
+            with tf.GradientTape() as dtape:
+                dtape.watch(model.trainable_variables)
+                x = model(X_d.reshape(-1,3) + 1e-4*np.random.randn(X_d.shape[0], 3))
+                loss += 25.0*model.log_prob(x, y_l.reshape(-1,2), y_d)/150.0
+    grads = dtape.gradient(loss, model.trainable_variables)
+    return loss, grads
 
 ####################################################################################
 ########################### Plotting functions #####################################
@@ -1266,7 +1443,7 @@ def plot_eof(var, lats, lons, text, n = 2):
         axes.set_aspect('auto', adjustable=None)
     
     f3_ax4 = fig.add_subplot(gs[:, -1])
-    plt.colorbar(cs, cax = f3_ax4, aspect = 5, fraction = 0.01);
+    plt.colorbar(cs, cax = f3_ax4, aspect = 5, fraction = 0.01)
     plt.suptitle(text)
     plt.savefig(text+'_'+str(n)+'_'+'EOF.png')
     plt.show()

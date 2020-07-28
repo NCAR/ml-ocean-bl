@@ -23,7 +23,6 @@ import xarray as xr
 import pandas as pd
 import numpy as np
 from netCDF4 import Dataset
-from glob import glob
 from scipy.interpolate import interpn
 from mpl_toolkits.basemap import maskoceans
 
@@ -118,60 +117,20 @@ m_std_anom = m_std_anom.reset_index()
 m_anom['mldb_full'] = m_full.mldb.copy()
 m_anom['mldb_anom_std'] = m_std_anom.mldb.copy()
 
-# Combine Data
-
-rng = np.random.default_rng(10)
-m_time = np.zeros((200, 1790))
-m_lat = np.ones_like(m_time)
-m_lon = np.ones_like(m_time)
-m_mldb_full = np.ones_like(m_time)
-m_mldb_anom = np.ones_like(m_time)
-m_mldb_std_anom = np.ones_like(m_time)
-for i in range(m_anom.week.unique().size):
-    mask = m_anom.week == m_anom.week.unique()[i]
-    t_temp = np.array(m_anom.time[mask])
-    lat_temp = np.array(m_anom.lat[mask])
-    lon_temp = np.array(m_anom.lon[mask])
-    mldb_anom_temp = np.array(m_anom.mldb[mask])
-    mldb_full_temp = np.array(m_anom.mldb_full[mask])
-    mldb_std_anom_temp = np.array(m_anom.mldb_anom_std[mask])
-    index = np.arange(mask.sum())
-    rng.shuffle(index)
-    m_time[i, :] = t_temp[index[:1790]]
-
-    m_lat[i, :] = lat_temp[index[:1790]]
-
-    m_lon[i, :] = lon_temp[index[:1790]]
-    
-    m_mldb_full[i, :] = mldb_full_temp[index[:1790]]
-
-    m_mldb_anom[i, :] = mldb_anom_temp[index[:1790]]
-    
-    m_mldb_std_anom[i, :] = mldb_std_anom_temp[index[:1790]]
-
-
 
 ####################################################################################
 ############################# Combine Data #########################################
 ####################################################################################
 
-ds = xr.Dataset(
-        {'mldbmax': (['time', 'index'], m_mldb_full),
-         'mldbmax_anomaly' : (['time', 'index'], m_mldb_anom),
-         'mldbmax_std_anomaly': (['time', 'index'], m_mldb_std_anom),
-         'lat': (['time', 'index'], m_lat),
-         'lon': (['time', 'index'], m_lon),
-         'date': (['time', 'index'], np.array(pd.to_datetime(m_time.flatten())).reshape(200, -1))
-        },
-        coords={'time': time,
-                'index': np.arange(1790)}
-)
+ds = m_anom.to_xarray()
+ds_new = ds.drop('lat_cut').drop('lon_cut').drop('cartesian')
+ds_new.to_netcdf(path='mldbmax_full_anomalies_weekly_full.nc')
+print(ds)
 
 ####################################################################################
 ################################ Save Data #########################################
 ####################################################################################
 print('Saving Data')
-print(ds)
 ds.to_netcdf(path='mldbmax_full_anomalies_weekly.nc')
 
 ####################################################################################
