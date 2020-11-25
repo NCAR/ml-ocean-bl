@@ -4,6 +4,8 @@
 import numpy as np
 import tensorflow as tf
 import tensorflow_probability as tfp
+import tensorflow.keras as keras
+import gp
 tf.keras.backend.set_floatx('float64')
 tfd = tfp.distributions
 tfb = tfp.bijectors

@@ -3,6 +3,7 @@
 ####################################################################################
 import numpy as np
 import tensorflow as tf
+import tensorflow.keras as keras
 import tensorflow_probability as tfp
 tf.keras.backend.set_floatx('float64')
 import gp

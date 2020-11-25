@@ -3,6 +3,7 @@
 ####################################################################################
 import numpy as np
 import tensorflow as tf
+import tensorflow.keras as keras
 import tensorflow_probability as tfp
 tf.keras.backend.set_floatx('float64')
 tfd = tfp.distributions
@@ -31,7 +32,7 @@ class GPR(keras.Model):
         optimizer.apply_gradients(zip(grads, gprm.trainable_variables))
         return loss
         
-    def call(self, x, y_l, noise = None):
+    def call(self, x, y_l, noise = None, number_of_opt_steps = 20):
         # Calculuates a gaussian process
         # m = Lx + V
         # where L = Kyx (Kxx + \sigmaI)^{-1}
@@ -52,7 +53,7 @@ class GPR(keras.Model):
         noise_variance = tfp.util.TransformedVariable(
                     np.exp(-5), tfb.Exp(), name='observation_noise_variance')
         
-        if noise is not None
+        if noise is not None:
             gp = tfd.GaussianProcess(
                 kernel=kernel,
                 index_points=inputs,
@@ -63,8 +64,8 @@ class GPR(keras.Model):
             index_points=inputs,
             observation_noise_variance=noise_variance)
 
-        optimizer = tf.optimizers.Adam(learning_rate=.05, beta_1=.5, beta_2=.99)
-        for i in range(20):
+        optimizer = tf.optimizers.Adam(learning_rate=.01, beta_1=.5, beta_2=.99)
+        for i in range(number_of_opt_steps):
             neg_log_likelihood_ = self.optimize(x, gp, optimizer)
 
         

@@ -82,7 +82,7 @@ def train(dataset, model, epochs = 500, print_epoch = 100, lr = 0.001, num_early
                                          'test correlation = {:.2f}'.format(losses[epoch,5]),
                  )
         
-        if losses[epoch,6] > early_stopping_min_value:
+        if losses[epoch,5] > early_stopping_min_value:
             early_stopping_min_value = losses[epoch, 5]
             early_stopping_counter = 0
             model.save_weights('./saved_model/temp/temp_model_save')

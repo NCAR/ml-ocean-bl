@@ -4,6 +4,8 @@
 import numpy as np
 from netCDF4 import Dataset
 import tensorflow as tf
+import tensorflow.keras as keras
+
 tf.keras.backend.set_floatx('float64')
 import gp
 
