@@ -68,8 +68,8 @@ To simply download the already preprocessed data used in the paper mentioned abo
     sh wget_preprocessed_surface_argo_data.sh
 
 
-Usage and Training 
-...................
+Training and Usage
+----------------------------
 
 For details on the training and testing procedures, see the notebook ./notebooks/model_train_Example.ipynb. For information about how the
 data should be organized, see ./mloceanbl/data.py. For detail on the model class, see ./mloceanbl/models.py. Individual NN models: Linear, 
