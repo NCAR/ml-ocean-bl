@@ -16,9 +16,9 @@ import gp
     
 class ANN_dropout(keras.Model):
     r"""
-    Implements an artificial neural network for the relationship x = f(X) + b + noise, 
+    Implements an artificial neural network for the relationship x = f(X) + noise, 
     where X = np.vstack(X[0], X[1], ...) with training model y = Lx + V, where L and V 
-    are obtained via GP regression.
+    are obtained via GP regression. Dropout is implemented to help estimates noise.
     
     Input arguments - input_dim, number of rows of X
                     - n_features, number of columns of X
@@ -31,8 +31,6 @@ class ANN_dropout(keras.Model):
                      - m, mean estimate of m = Lx + V
                      - v, diagonal variance of gp covariance V
                      
-    Parameters       - w_i, linear weight matrix, shape (input_dim, n_features)
-                     - b_i, bias, shape (input_dim, )
     
     Inherited Parameters - input_noise, input-dependent noise estimate, shape (input_dim,)
                          gives estimate of variances 
@@ -102,13 +100,17 @@ class ANN_dropout(keras.Model):
         """
         
         ## ANN Map
-#         x = tf.reshape(self.L(tf.cast(tf.reshape(X_d, [1,-1]), dtype='float64'), training=True), (-1, ))
         x_samp = self.monte_carlo_sample(tf.cast(tf.reshape(X_d, [1,-1]), dtype='float64'), training=True)
         x = tf.math.reduce_mean(x_samp, axis=0)
         self.noise = tf.math.reduce_mean((x - x_samp), axis=0)
         return x
     
     def log_prob(self, y_pred, y_l, y_true):
+        r"""
+        Computes the gaussian process log-likelihood of the data given
+        the estimate y_pred (or x from self.call(...) ). self.sample
+        is produced for other metric purposes (see ./train.py)
+        """
         self.m, self.v = self.gp(y_pred, y_l, noise = self.noise)
         self.sample = self.gp.sample()
         loss = -self.gp.log_prob( y_true )

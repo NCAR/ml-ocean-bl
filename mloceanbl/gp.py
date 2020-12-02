@@ -19,6 +19,28 @@ import scipy.sparse as sp
 
 ################################# Main GPR Class ###################################
 class GPR(keras.Model):
+    r"""
+    Implements a Gaussian Process with a squared exponential kernel. The Gaussian
+    Process kernel has three hyperparameters controlling the magnitude, length scale,
+    and noise for the GP. If there is known input noise, that noise is included in the
+    model. The hyperparameters are optimized via maximum likelihood using a set number
+    of time steps (this optimization is not supposed to be perfect, just good enough). 
+
+    Input arguments - x_l,  locations of inputs, shape (input_dim, 2)
+                            columns house (lon,lat) coordinates respectively.
+                    - x,    values at locations
+                    - noise, Input noise, if known. Shape is same as x.
+
+    Output arguments - m, mean of the gaussian process.
+                     - V, covariance of the gaussian process.
+    
+    Subroutines     - sample,       produce a sample from the gaussian process
+                    - log_prob,     estimate the log likelihood of the data given
+                                    the gaussian process.
+                    - reanalysis,   Produce the best update of mld given a model estimate
+                                    and observed data.
+
+    """
     def __init__(self, x_l, dtype='float64', **kwargs):
         super(GPR, self).__init__(name='gaussian_process', dtype='float64', **kwargs)
         self.x_l = tf.cast(x_l, dtype='float64')
@@ -122,10 +144,6 @@ class GPR(keras.Model):
         updates = tf.reshape(tf.gather(x, self.indexes), (-1,1)) + tf.linalg.matmul(tf.linalg.diag(tf.gather(noise, self.indexes)),
                                                              tf.linalg.matmul(self.L, S, transpose_a = True) )
         updates = tf.reshape(updates, (-1,))
-        print(tf.reshape(self.indexes, (-1,1)).shape)
-        print(updates.shape)
-        
-        print(u.shape)
         u = tf.tensor_scatter_nd_update(u, tf.reshape(self.indexes, (-1,1)), updates)
         return u
 
@@ -212,7 +230,6 @@ def haversine_dist(X, X2, sparse = False):
         row_i = np.array([], dtype=int)
         col_i = np.array([], dtype=int)
         data = np.array([])
-        length_scale = 5.0
         for i in range(X.shape[0]):
             loc = np.argwhere(((X[i,0] - X2[:,0])**2 + (X[i,1] - X2[:,1])**2) < 5)[:,0]              
             d = np.sin(X2[loc,1]*pi - X[i,1]*pi)**2

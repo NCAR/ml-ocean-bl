@@ -2,7 +2,6 @@
 ########################### Import libraries #######################################
 ####################################################################################
 import numpy as np
-from netCDF4 import Dataset
 import tensorflow as tf
 import tensorflow.keras as keras
 

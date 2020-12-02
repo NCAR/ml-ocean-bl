@@ -16,9 +16,10 @@ import gp
        
 class VANN(keras.Model):
     r"""
-    Implements an artificial neural network for the relationship x = f(X) + b + noise, 
+    Implements an artificial neural network for the relationship x = f(X) + noise, 
     where X = np.vstack(X[0], X[1], ...) with training model y = Lx + V, where L and V 
-    are obtained via GP regression.
+    are obtained via GP regression. Noise is estimated by parameterization via a 
+    Gaussian distribution at the output layer.
     
     Input arguments - input_dim, number of rows of X
                     - n_features, number of columns of X
@@ -31,8 +32,6 @@ class VANN(keras.Model):
                      - m, mean estimate of m = Lx + V
                      - v, diagonal variance of gp covariance V
                      
-    Parameters       - w_i, linear weight matrix, shape (input_dim, n_features)
-                     - b_i, bias, shape (input_dim, )
     
     Inherited Parameters - input_noise, input-dependent noise estimate, shape (input_dim,)
                          gives estimate of variances 

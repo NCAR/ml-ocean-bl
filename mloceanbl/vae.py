@@ -18,7 +18,10 @@ class VAE(keras.Model):
     r"""
     Implements a variational autoencoder for the relationship x = f(X) + b + noise, 
     where X = np.vstack(X[0], X[1], ...) with training model y = Lx + V, where L and V 
-    are obtained via GP regression.
+    are obtained via GP regression. f(X) is learned via a variational auto-encoder. 
+    The auto encoder encodes and decodes the satellite sea surface data to train a 
+    latent space on the gridded input data. From this latent space, we attach a third
+    network that then predicts the mixed layer depth. 
     
     Input arguments - input_dim, number of rows of X
                     - n_features, number of columns of X

@@ -3,6 +3,10 @@ __pycache__/
 *.py[cod]
 *$py.class
 
+# Data
+./notebooks/data/
+./notebooks/saved_model/
+
 # C extensions
 *.so
 
