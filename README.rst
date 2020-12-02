@@ -54,6 +54,7 @@ Depth from Dense Satellite and Sparse In-Situ Observations' Foster et al. (ex. 2
 For the former, see the jupyter notebook ./notebooks/download_preprocess_data.ipynb and run the corresponding lines. Users can also run 
 
 .. code-block:: bash
+
     sh wget_unprocessed_surface_argo_data.sh
 
 and see the python files ./mloceanbl/preprocess_sss_sst_ssh.py and ./mloceanbl/preprocess_mld.py. Note that in order to download the 
@@ -63,10 +64,12 @@ drive.
 To simply download the already preprocessed data used in the paper mentioned above, simply run
 
 .. code-block:: bash
+
     sh wget_preprocessed_surface_argo_data.sh
 
-Usage 
-.....
+
+Usage and Training 
+...................
 
 For details on the training and testing procedures, see the notebook ./notebooks/model_train_Example.ipynb. For information about how the
 data should be organized, see ./mloceanbl/data.py. For detail on the model class, see ./mloceanbl/models.py. Individual NN models: Linear, 
