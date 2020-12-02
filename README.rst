@@ -22,11 +22,6 @@ Machine Learning Ocean Boundary Layer (ML-Ocean-BL)
     :alt: Conda Version
 
 
-See documentation_ for more information.
-
-.. _documentation: https://ml-ocean-bl.readthedocs.io
-
-
 Installation
 ------------
 
