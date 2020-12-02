@@ -67,6 +67,10 @@ Training and Usage
 ----------------------------
 
 For details on the training and testing procedures, see the notebook ./notebooks/model_train_Example.ipynb. For information about how the
-data should be organized, see ./mloceanbl/data.py. For detail on the model class, see ./mloceanbl/models.py. Individual NN models: Linear, 
+data should be organized, see ./mloceanbl/data.py. 
+
+For detail on the model class, see ./mloceanbl/models.py. Individual NN models: Linear, 
 ANN, ANN with Dropout, ANN with parameterized output distribution, and VAE can be found at ./mloceanbl/linear.py, ann.py, ann_dropout.py, 
-vann.py, vae.py. Details on the training proceedure can be found in ./mloceanbl/train.py. 
+vann.py, vae.py. 
+
+Details on the training proceedure can be found in ./mloceanbl/train.py. 
