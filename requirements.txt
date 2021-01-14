@@ -1,2 +1,11 @@
+numpy
+scipy
+tensorflow
+tensorflow-probability
 dask
 xarray
+pandas
+matplotlib
+jupyter
+jupyterlab
+netcdf4

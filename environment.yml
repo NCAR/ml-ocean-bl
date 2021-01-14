@@ -1,0 +1,22 @@
+name: mlocean
+channels:
+  - conda-forge
+dependencies:
+  - python=3.8
+  - numpy
+  - scipy
+  - matplotlib
+  - xarray
+  - netcdf4
+  - dask
+  - pandas
+  - pyyaml
+  - pytest
+  - distributed
+  - pip
+  - basemap
+  - jupyter
+  - jupyterlab
+  - pip:
+      - tensorflow
+      - tensorflow-probability
