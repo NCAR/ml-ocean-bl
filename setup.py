@@ -30,9 +30,9 @@ setup(
     packages=find_packages(),
     include_package_data=True,
     install_requires=install_requires,
-    license='open_source_license',
+    license='Apache',
     zip_safe=False,
-    keywords='project_name',
+    keywords='ml-ocean-bl',
     use_scm_version=True,
-    setup_requires=['setuptools_scm', 'setuptools>=30.3.0', 'setuptools_scm_git_archive'],
+    setup_requires=['setuptools_scm', 'setuptools>=30.3.0', "setuptools_scm_git_archive"],
 )
