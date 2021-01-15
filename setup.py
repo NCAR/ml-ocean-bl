@@ -33,6 +33,7 @@ setup(
     license='Apache',
     zip_safe=False,
     keywords='ml-ocean-bl',
-    use_scm_version=True,
+    version="0.1",
+    use_scm_version=False,
     setup_requires=['setuptools_scm', 'setuptools>=30.3.0', "setuptools_scm_git_archive"],
 )
