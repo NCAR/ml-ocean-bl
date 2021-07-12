@@ -37,7 +37,6 @@ def preprocess_surface_data(sss_path, sst_path, ssh_path, sss_sst_ssh_output_pat
     ############################### Salinity ###### ####################################
 
     ## Import SSS Dataset
-#         SSS_path = '/glade/work/dwhitt/OISSS/'
     sss_files = sorted(glob(sss_path+'*.nc'))
     sss = xr.open_mfdataset(sss_files, decode_times=False, combine='by_coords')
 
@@ -55,7 +54,6 @@ def preprocess_surface_data(sss_path, sst_path, ssh_path, sss_sst_ssh_output_pat
     ########################### Sea Level Temperatures ####################################
 
     ## Import SST Dataset
-#         SST_path = '/glade/work/dwhitt/GHRSST_OIMW/'
     sst_files = sorted(glob(sst_path+'*.nc'))
     sst = xr.open_mfdataset(sst_files, combine='by_coords')
 
@@ -65,7 +63,6 @@ def preprocess_surface_data(sss_path, sst_path, ssh_path, sss_sst_ssh_output_pat
     ############################### Sea Level Height ####################################
 
     ## Import SSH Dataset
-#         SSH_path = '/glade/scratch/dwhitt/measures_ssh/'
     ssh_files = sorted(glob(ssh_path+'*.nc'))
     ssh = xr.open_mfdataset(ssh_files, combine='by_coords')
 
@@ -92,12 +89,20 @@ def preprocess_surface_data(sss_path, sst_path, ssh_path, sss_sst_ssh_output_pat
     # 3. Remove climatology of sst data and interpolate to spatial and temporal grid.
 
     ## Create training, test, split
-    i = np.arange(200)
-    np.random.seed(10)
-    np.random.shuffle(i)
-    i_train = np.sort(i[:150])
-    i_test = np.sort(i[150:175])
-    i_validate = np.sort(i[175:])
+    index = np.arange(200)
+    rng = np.random.default_rng(42)
+    train_test_index = rng.permutation(index[:160]) 
+    i_train = train_test_index[:150]
+    i_test = np.append(train_test_index[150:], index[160:175])
+    i_validate = index[175:]
+    
+#     i = np.arange(200)
+#     i_validate = np.sort(i[175:])
+#     np.random.seed(10)
+#     np.random.shuffle(i)
+#     i_train = np.sort(i[:150])
+#     i_test = np.sort(i[150:175])
+#     i_validate = np.sort(i[175:])
 
     ## Create a fine ocean mask for interpolation purposes
     Array = np.ma.zeros((ssh.lat.size,ssh.lon.size))

@@ -34,7 +34,8 @@ tfb = tfp.bijectors
 ####################################################################################
 ########################### Training Proceedure ####################################
 ####################################################################################
-def train(dataset, model, epochs = 500, print_epoch = 100, lr = 0.001, num_early_stopping = 500, num_restarts = 3, mini_batch_size=10):
+def train(dataset, model, epochs = 500, print_epoch = 100, lr = 0.001, num_early_stopping = 500, num_restarts = 3, 
+          mini_batch_size=10, save_location = 'TEMP', save_name = 'temp'):
     losses = np.zeros((epochs,6))
     
     n_steps_train = dataset.i_train.size
@@ -51,25 +52,27 @@ def train(dataset, model, epochs = 500, print_epoch = 100, lr = 0.001, num_early
     # Iterate over epochs.
     for epoch in range(epochs):
         
-        train_minibatch(dataset, model, mini_batch_size, optimizer)
+        train_minibatch(dataset, model, mini_batch_size, optimizer, save_location + '/training_temp/temp')
         
         for steps in np.random.choice(dataset.i_train, size = 21, replace = False):
             X_d, X_l, y_d, y_l = dataset.get_index(steps)     
             x = model(X_d)
-            loss = model.log_prob(x, y_l.reshape(-1,2), y_d) 
-            losses[epoch, 0] += tf.math.reduce_mean( (y_d-model.sample)**2)/21.0
+            model.gp.fit(x, model.var)
+            loss = model.log_prob(x, y_l.reshape(-1,2), y_d, training = False) 
+            losses[epoch, 0] += tf.math.reduce_mean( (y_d-model.m)**2)/21.0
             losses[epoch, 1] += np.mean( (y_d < (model.m+np.sqrt(model.v) )) & 
                                           (y_d > (model.m-np.sqrt(model.v) )) )/21.0
-            losses[epoch, 2] += pearsonr(model.sample.numpy().flatten(), y_d.flatten())[0] / 21.0
+            losses[epoch, 2] += pearsonr(model.m.numpy().flatten(), y_d.flatten())[0] / 21.0
                 
         for steps in range(n_steps_test):
             X_d, X_l, y_d, y_l = dataset.get_index(dataset.i_test[steps])     
             x = model(X_d)
-            loss = model.log_prob(x, y_l.reshape(-1,2), y_d) 
-            losses[epoch, 3] += tf.math.reduce_mean( (y_d-model.sample)**2)/n_steps_test
+            model.gp.fit(x, model.var)
+            loss = model.log_prob(x, y_l.reshape(-1,2), y_d, training = False) 
+            losses[epoch, 3] += tf.math.reduce_mean( (y_d-model.m)**2)/n_steps_test
             losses[epoch, 4] += np.mean( (y_d < (model.m+np.sqrt(model.v) )) & 
                                           (y_d > (model.m-np.sqrt(model.v) )) )/n_steps_test
-            losses[epoch, 5] += pearsonr(model.sample.numpy().flatten(), y_d.flatten())[0] / n_steps_test
+            losses[epoch, 5] += pearsonr(model.m.numpy().flatten(), y_d.flatten())[0] / n_steps_test
 
 
         if epoch % print_epoch == 0:
@@ -85,16 +88,16 @@ def train(dataset, model, epochs = 500, print_epoch = 100, lr = 0.001, num_early
         if losses[epoch,5] > early_stopping_min_value:
             early_stopping_min_value = losses[epoch, 5]
             early_stopping_counter = 0
-            model.save_weights('./saved_model/temp/temp_model_save')
+            model.save_weights(save_location + '/temp/temp')
         else:
             early_stopping_counter += 1
         if (early_stopping_counter > num_early_stopping):
             if (restart_counter < num_restarts):
                 print('Early Stopping at iteration {:d}'.format(epoch))
                 print('Restarting with smaller learning_rate')
-                model.load_weights('./saved_model/temp/temp_model_save')
+                model.load_weights(save_location + '/temp/temp')
                 lr = lr/4.0
-                optimizer = tf.keras.optimizers.Adam(learning_rate=lr)
+                optimizer.learning_rate.assign(lr)
                 restart_counter += 1
                 early_stopping_counter = 0
             else:
@@ -102,16 +105,16 @@ def train(dataset, model, epochs = 500, print_epoch = 100, lr = 0.001, num_early
                 stop = True
         if stop:
             break
-    model.load_weights('./saved_model/temp/temp_model_save')
-    model.save_weights('./saved_model/'+model.name+'{:.3f}'.format(early_stopping_min_value))
+    model.load_weights(save_location + '/temp/temp')
+    model.save_weights(save_location + '/' + save_name)
     return losses[:epoch, :]
 
-def train_minibatch(dataset, model, mini_batch_size, optimizer):
+def train_minibatch(dataset, model, mini_batch_size, optimizer, save_location):
     n_steps_train = dataset.i_train.size
     batch_index = np.random.permutation(n_steps_train)
     num_minibatch = np.ceil(n_steps_train / mini_batch_size).astype(int)
 
-    X_d_test_batch = np.zeros((mini_batch_size, model.input_dim, model.n_features))
+    X_d_test_batch = np.zeros((mini_batch_size, model.x_dim, model.y_dim, model.n_features))
     y_d_test_batch = []
     y_l_test_batch1 = []
     y_l_test_batch2 = []
@@ -127,7 +130,7 @@ def train_minibatch(dataset, model, mini_batch_size, optimizer):
                         tf.ragged.constant(y_l_test_batch2, ragged_rank=1)), axis=-1)
     i = 0
     for batch in range(num_minibatch - 1):
-        X_d_batch = np.zeros((mini_batch_size, model.input_dim, model.n_features))
+        X_d_batch = np.zeros((mini_batch_size, model.x_dim, model.y_dim, model.n_features))
         y_d_batch = []
         y_l_batch1 = []
         y_l_batch2 = []
@@ -142,27 +145,30 @@ def train_minibatch(dataset, model, mini_batch_size, optimizer):
         y_d_batch = tf.ragged.constant(y_d_batch, ragged_rank=1)
         y_l_batch = tf.stack((tf.ragged.constant(y_l_batch1, ragged_rank=1),
                             tf.ragged.constant(y_l_batch2, ragged_rank=1)), axis=-1)
-        batch_train_mcmc(optimizer, model, X_d_batch, y_d_batch, y_l_batch, X_d_test_batch, y_d_test_batch, y_l_test_batch, mini_batch_size, n_steps_train)
+        batch_train_mcmc(optimizer, model, X_d_batch, y_d_batch, y_l_batch, X_d_test_batch, y_d_test_batch, y_l_test_batch, mini_batch_size, n_steps_train, save_location)
 
-def batch_train_mcmc(optimizer, model, X_d_batch, y_d_batch, y_l_batch, X_d_test_batch, y_d_test_batch, y_l_test_batch, mini_batch_size, n_steps_train):
-    old_weights = model.save_weights('./saved_model/training_temp/temp')
+def batch_train_mcmc(optimizer, model, X_d_batch, y_d_batch, y_l_batch, X_d_test_batch, y_d_test_batch, y_l_test_batch, mini_batch_size, n_steps_train, save_location):
+    old_weights = model.save_weights(save_location)
     test_loss = 0.0
     for j in range(mini_batch_size):
         X_d = X_d_test_batch[j]
         y_d = y_d_test_batch[j]
         y_l = y_l_test_batch[j]
-        x = model(X_d + tf.random.normal( (X_d.shape[0], 3), stddev=1e-4, dtype=tf.float64) )
+        x = model(X_d + tf.random.normal( tf.shape(X_d), stddev=1e-4, dtype=tf.float64) )
         test_loss += mini_batch_size*model.log_prob(x, y_l, y_d)/n_steps_train
     
     loss = 0.0
-    for j in range(mini_batch_size):
-        with tf.GradientTape() as dtape:
-            X_d = X_d_batch[j]
+    with tf.GradientTape(persistent =  True) as dtape:
+        dtape.watch(model.trainable_variables)
+        x_batch = model(X_d_batch + tf.random.normal( tf.shape(X_d_batch), stddev=1e-3, dtype=tf.float64), training = True )
+        for j in range(mini_batch_size):
+            x = tf.squeeze(x_batch[j])
+            var = tf.squeeze(model.var[j])
             y_d = y_d_batch[j]
             y_l = y_l_batch[j]
-            dtape.watch(model.trainable_variables)
-            x = model(X_d + tf.random.normal( (X_d.shape[0], 3), stddev=1e-4, dtype=tf.float64) )
-            loss += mini_batch_size*model.log_prob(x, y_l, y_d)/n_steps_train
+            
+            # Evaluate log likelihood
+            loss += mini_batch_size*model.log_prob(x, y_l, y_d, var = var, batch_num = j, training = True)/n_steps_train
     # Apply gradients to model parameters
     grads = dtape.gradient(loss, model.trainable_variables)
     optimizer.apply_gradients(zip(grads, model.trainable_variables))
@@ -172,13 +178,13 @@ def batch_train_mcmc(optimizer, model, X_d_batch, y_d_batch, y_l_batch, X_d_test
         X_d = X_d_test_batch[j]
         y_d = y_d_test_batch[j]
         y_l = y_l_test_batch[j]
-        x = model(X_d + tf.random.normal( (X_d.shape[0], 3), stddev=1e-4, dtype=tf.float64) )
+        x = model(X_d + tf.random.normal( tf.shape(X_d), stddev=1e-3, dtype=tf.float64) )
         new_test_loss += mini_batch_size*model.log_prob(x, y_l, y_d)/n_steps_train
 
     alpha = tf.cast( (test_loss - new_test_loss)/np.sqrt(np.abs(test_loss)) , dtype='float64')
     if np.float64(np.random.rand()) > tf.exp(alpha):
         print('Reject!')
-        model.load_weights('./saved_model/training_temp/temp')
+        model.load_weights(save_location)
 
     
     

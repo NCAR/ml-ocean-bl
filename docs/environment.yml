@@ -12,3 +12,14 @@ dependencies:
   - sphinx=1.8.2
   - sphinx-copybutton=0.2.5
   - make
+  - numpy
+  - scipy
+  - xarray
+  - tensorflow
+  - properscoring
+  - pandas 
+  - glob
+  - matplotlib
+  - netcdf4
+  - scikit-learn
+  

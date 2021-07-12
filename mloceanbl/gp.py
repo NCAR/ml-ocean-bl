@@ -4,14 +4,15 @@
 import numpy as np
 import tensorflow as tf
 import tensorflow.keras as keras
-import tensorflow_probability as tfp
 tf.keras.backend.set_floatx('float64')
-tfd = tfp.distributions
-tfb = tfp.bijectors
-from tensorflow_probability.python.internal import tensor_util
-from tensorflow_probability.python.math.psd_kernels.internal import util
-from tensorflow_probability.python.math.psd_kernels.positive_semidefinite_kernel import PositiveSemidefiniteKernel
-import scipy.sparse as sp
+
+def warn(*args, **kwargs):
+    pass
+import warnings
+warnings.warn = warn
+
+from sklearn.gaussian_process import GaussianProcessRegressor
+from sklearn.gaussian_process.kernels import Matern
 
 ####################################################################################
 ########################### Define Models ##########################################
@@ -39,101 +40,98 @@ class GPR(keras.Model):
                                     the gaussian process.
                     - reanalysis,   Produce the best update of mld given a model estimate
                                     and observed data.
+    To do: Implement haversine distance in custom scikit learn kernel.
 
     """
     def __init__(self, x_l, dtype='float64', **kwargs):
         super(GPR, self).__init__(name='gaussian_process', dtype='float64', **kwargs)
         self.x_l = tf.cast(x_l, dtype='float64')
+        self.x_l = tf.reshape(self.x_l, (-1, 2))
         self.input_dim = self.x_l.shape[0]
         
+        self.kernel = 1.0 * Matern(length_scale=3.0, nu = 2.5, length_scale_bounds = (.25, 10))
+        self.kernel_noise = 1.0 * Matern(length_scale=3.0, nu = 2.5, length_scale_bounds = (.25, 10))
         
-    def optimize(self, x, gprm, optimizer):
-        with tf.GradientTape() as tape:
-            loss = -gprm.log_prob(x)
-        grads = tape.gradient(loss, gprm.trainable_variables)
-        optimizer.apply_gradients(zip(grads, gprm.trainable_variables))
-        return loss
+    def fit(self, x, noise = None):
+        x = tf.reshape(x, (-1,1)).numpy()
+        self.gpr = GaussianProcessRegressor(kernel=self.kernel, n_restarts_optimizer = 0, random_state=0)
+        self.gpr.fit(self.x_l, x)
+        self.Kxx = self.gpr.kernel_(self.x_l)
+        self.Kxx_chol = tf.linalg.cholesky(self.Kxx)
         
-    def call(self, x, y_l, noise = None, number_of_opt_steps = 20):
-        # Calculuates a gaussian process
-        # m = Lx + V
-        # where L = Kyx (Kxx + \sigmaI)^{-1}
-        # where V = Kyy - L Kxy + L\sigmaIL^{T}
-        
-        self.indexes = np.array([], dtype='int')
-        for i in range(y_l.shape[0]):
-            ind = np.argwhere( ((self.x_l[:, 0] - y_l[i, 0])**2 + (self.x_l[:,1] - y_l[i,1])**2 )<1.5 ).flatten()
-            self.indexes = np.append(self.indexes, ind)
-        inputs = tf.gather(self.x_l, self.indexes)
-        x = tf.gather(x, self.indexes)
-        
-        amplitude = tfp.util.TransformedVariable(1., 
-                            tfb.Exp(), dtype=tf.float64, name='amplitude')
-        length_scale = tfp.util.TransformedVariable(25., 
-                        tfb.Softplus(), dtype=tf.float64, name='length_scale')
-        kernel = ExponentiatedQuadratic(amplitude, length_scale)
-        noise_variance = tfp.util.TransformedVariable(
-                    np.exp(-5), tfb.Exp(), name='observation_noise_variance')
-        
+        self.gpr_noise = GaussianProcessRegressor(kernel=self.kernel_noise, n_restarts_optimizer = 0, random_state=0)
         if noise is not None:
-            gp = tfd.GaussianProcess(
-                kernel=kernel,
-                index_points=inputs,
-                observation_noise_variance=noise_variance + tf.reduce_mean(noise))
-        else:
-            gp = tfd.GaussianProcess(
-            kernel=kernel,
-            index_points=inputs,
-            observation_noise_variance=noise_variance)
-
-        optimizer = tf.optimizers.Adam(learning_rate=.01, beta_1=.5, beta_2=.99)
-        for i in range(number_of_opt_steps):
-            neg_log_likelihood_ = self.optimize(x, gp, optimizer)
-
+            noise = tf.reshape(noise, (-1, 1)).numpy()
+            self.gpr_noise.fit(self.x_l, noise)
+            
+            self.Kxx_noise = self.gpr_noise.kernel_(self.x_l)
+            self.Kxx_noise_chol = tf.linalg.cholesky(self.Kxx)
+    def call(self, x, y_l, noise = None, batch_size = 1, training = True):
         
+        if not training:
+            # Slower gaussian process regression. To do: speed up?
+            self.Kyx = self.gpr.kernel_(y_l, self.x_l)
+            self.Kyy = self.gpr.kernel_(y_l)
+            self.m = tf.linalg.matmul(self.Kyx, tf.linalg.cholesky_solve(self.Kxx_chol, x))
+            self.V = self.Kyy - tf.linalg.matmul(self.Kyx, tf.linalg.cholesky_solve(self.Kxx_chol, self.Kyx.T))
 
-        Kxx = kernel._apply(inputs, inputs)  +  \
-                (noise_variance)*tf.eye(x.shape[0], dtype='float64')
-        if noise is not None:
-            noise = tf.gather(noise, self.indexes)
-            noise = 1e-6+tf.math.maximum(noise, np.float64(0.0))
-            Kxx +=  tf.linalg.diag(noise)
-        Kxy = kernel._apply(inputs, y_l)
-        Kyy = kernel._apply(y_l, y_l)
-        self.Kyy = tf.linalg.set_diag( Kyy, tf.linalg.diag_part(Kyy) + 1e-3)
-        K_chol = tf.linalg.cholesky(Kxx)
-        self.L = tf.linalg.matmul(Kxy,
-                            tf.linalg.cholesky_solve(K_chol, tf.eye(x.shape[0], dtype='float64')),
-                            transpose_a = True)
-        self.m = tf.linalg.matmul(self.L, tf.reshape(x, (-1,1)) )
-                            
-        self.V = self.Kyy - tf.linalg.matmul(self.L, Kxy)
-        if noise is not None:
-            V_temp =  tf.linalg.matmul(
-                                tf.linalg.matmul(self.L, 
-                                    tf.linalg.diag(noise)),
-                                self.L, transpose_b = True)
-            self.V += V_temp
+            if noise is not None:
+                noise = tf.reshape(noise, (-1,))
+                self.Kyx_noise = self.gpr_noise.kernel_(y_l, self.x_l)
+                self.Kyy_noise = self.gpr_noise.kernel_(y_l)
+                self.V += tf.linalg.matmul(
+                            tf.linalg.matmul(self.Kyx_noise, 
+                                             tf.linalg.cholesky_solve(self.Kxx_noise_chol, tf.linalg.diag(noise) ) ),
+                            self.Kyx_noise.T)
+        if training:
+            # Old, fast, linear interpolation
+            x_dim = self.x_l.shape[0]
+            y_dim = y_l.shape[0]
+            l = []
+            ind = []
+            for i in range(y_dim):
+                d = np.sin( (self.x_l[:,1] - y_l[i,1])/180*np.pi)**2
+                d += np.cos(self.x_l[:, 1]*np.pi/180.)*np.cos(y_l[i,1]*np.pi/180.)*np.sin( (self.x_l[:,0] - y_l[i,0])/180.*np.pi)**2
+                d = 2*6.378*np.arcsin(np.sqrt(d))
+                ind_temp = tf.where( d < 0.25 )
+                d = tf.gather(d, ind_temp)
+                l_temp = tf.zeros((x_dim, 1), dtype = 'float64')
+                l_temp = tf.tensor_scatter_nd_update(l_temp, ind_temp, d / tf.reduce_sum(d))
+                l.append(l_temp)
+            self.L = tf.reshape(tf.stack(l), (y_dim, x_dim))
+
+            self.m = tf.linalg.matmul(self.L, x)
+            self.m = tf.squeeze(self.m)
+            self.V = 1e-3*tf.eye(y_dim, dtype = 'float64')
+            
+            if noise is not None:
+                self.V += tf.linalg.matmul(L, 
+                            tf.linalg.matmul(tf.linalg.diag(noise),
+                                        L, transpose_b = True))
+            if tf.reduce_min( tf.linalg.diag(self.V)) < 1e-3:
+                self.V += 1e-3*tf.eye(y_dim, dtype = 'float64')
+        
         self.V_chol = tf.linalg.cholesky(self.V)
         
-        
-        return tf.reshape(self.m, (-1,)), tf.linalg.diag_part(self.V)
+        return self.m, tf.linalg.diag_part(self.V)
     
     def sample(self, num_samples = 1):
-        noise = tf.random.normal( (self.m.shape[0], num_samples), dtype='float64')
-        sample = self.m + tf.linalg.matmul(
+        noise = tf.random.normal( shape = (int(self.m.shape[0]), int(num_samples)), dtype='float64')
+        sample = tf.linalg.matmul(
                     self.V_chol,
                     noise,
                     )
-        return tf.reshape(sample, (-1,1))
+        sample += tf.reshape(self.m, (-1,1))
+        return tf.reshape(sample, (-1,num_samples))
     
-    def log_prob(self, x):
-        z = (self.m - tf.reshape(x, (-1,1)))
-        l = 0.5 * tf.matmul(z, 
+    def log_prob(self, x, batch_size = 1):
+        
+        z = (self.m - tf.reshape(x, (batch_size, -1,1)))
+        l = tf.reduce_mean(tf.matmul(z, 
                             tf.linalg.cholesky_solve(self.V_chol,
                                          z),
-                            transpose_a = True)
-        l += 0.5*x.shape[0]*tf.math.reduce_sum(tf.math.log(tf.linalg.diag_part(self.V_chol)))
+                            transpose_a = True))
+        l += tf.reduce_mean(tf.math.log(tf.linalg.diag_part(self.V_chol)))
         return -l
     
     def reanalysis(self, x, y_d, noise):
@@ -147,81 +145,6 @@ class GPR(keras.Model):
         u = tf.tensor_scatter_nd_update(u, tf.reshape(self.indexes, (-1,1)), updates)
         return u
 
-
-####################### Kernel Class #########################################################
-    
-class ExponentiatedQuadratic(PositiveSemidefiniteKernel):
-    def __init__(self,
-               amplitude=None,
-               length_scale=None,
-               feature_ndims=1,
-               validate_args=False,
-               name='ExponentiatedQuadratic'):
-        parameters = dict(locals())
-        with tf.name_scope(name):
-            dtype = util.maybe_get_common_dtype(
-                [amplitude, length_scale])
-        self._amplitude = tensor_util.convert_nonref_to_tensor(
-          amplitude, name='amplitude', dtype=dtype)
-        self._length_scale = tensor_util.convert_nonref_to_tensor(
-          length_scale, name='length_scale', dtype=dtype)
-        super(ExponentiatedQuadratic, self).__init__(
-              feature_ndims,
-              dtype=dtype,
-              name=name,
-              validate_args=validate_args,
-              parameters=parameters)
-
-    @property
-    def amplitude(self):
-        """Amplitude parameter."""
-        return self._amplitude
-
-    @property
-    def length_scale(self):
-        """Length scale parameter."""
-        return self._length_scale
-
-    def _batch_shape(self):
-        scalar_shape = tf.TensorShape([])
-        return tf.broadcast_static_shape(
-            scalar_shape if self.amplitude is None else self.amplitude.shape,
-            scalar_shape if self.length_scale is None else self.length_scale.shape)
-
-    def _batch_shape_tensor(self):
-        return tf.broadcast_dynamic_shape(
-            [] if self.amplitude is None else tf.shape(self.amplitude),
-            [] if self.length_scale is None else tf.shape(self.length_scale))
-
-    def _apply(self, x1, x2, example_ndims=0):
-        x1 = tf.reshape(x1, (-1, 2))
-        x2 = tf.reshape(x2, (-1, 2))
-        data = haversine_dist(x1, x2)
-        exponent = -0.5 * data
-        
-        if self.length_scale is not None:
-            length_scale = tf.convert_to_tensor(self.length_scale)
-            length_scale = util.pad_shape_with_ones(
-              length_scale, example_ndims)
-            exponent = exponent / length_scale**2
-        if self.amplitude is not None:
-            amplitude = tf.convert_to_tensor(self.amplitude)
-            amplitude = util.pad_shape_with_ones(amplitude, example_ndims)
-            exponent = exponent + 2. * tf.math.log(amplitude)
-
-        return tf.exp(exponent) # tf.exp
-
-    def _parameter_control_dependencies(self, is_init):
-        if not self.validate_args:
-            return []
-        assertions = []
-        for arg_name, arg in dict(amplitude=self.amplitude,
-                              length_scale=self.length_scale).items():
-            if arg is not None and is_init != tensor_util.is_ref(arg):
-                assertions.append(assert_util.assert_positive(
-                arg,
-                message='{} must be positive.'.format(arg_name)))
-        return assertions
 
 ###################### Distance Function #########################################################
 def haversine_dist(X, X2, sparse = False):

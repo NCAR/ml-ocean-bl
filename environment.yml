@@ -17,6 +17,8 @@ dependencies:
   - basemap
   - jupyter
   - jupyterlab
+  - properscoring
+  - scikit-learn
   - pip:
       - tensorflow
       - tensorflow-probability

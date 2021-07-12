@@ -106,8 +106,15 @@ class VANN(keras.Model):
         self.noise = tf.reshape( self.x_dist.variance(), (-1,))
         return x
     
-    def log_prob(self, y_pred, y_l, y_true):
-        self.m, self.v = self.gp(y_pred, y_l, noise = self.noise)
+    def log_prob(self, y_pred, y_l, y_true, var = None, batch_num = None, training = True):
+        r"""
+        Computes the gaussian process log-likelihood of the data given
+        the estimate y_pred (or x from self.call(...) ). self.sample
+        is produced for other metric purposes (see ./train.py)
+        """
+        if var is None:
+            var = self.var
+        self.m, self.v = self.gp(y_pred, y_l, noise = var, training = True)
         self.sample = self.gp.sample()
         loss = -self.gp.log_prob( y_true )
         loss += tf.math.reduce_mean(self.L.losses)

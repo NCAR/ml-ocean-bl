@@ -12,8 +12,8 @@
 ####################################################################################
 import xarray as xr
 import numpy as np
-from .preprocess_mld import preprocess_argo_data
-from .preprocess_sss_sst_ssh import preprocess_surface_data
+from preprocess_mld import preprocess_argo_data
+from preprocess_sss_sst_ssh import preprocess_surface_data
 ####################################################################################
 ########################### Import Data ############################################
 ####################################################################################
@@ -38,14 +38,12 @@ def preprocess_data(sss_path, sst_path, ssh_path,
 
 class dataset():
     def __init__(self, lat_bounds, lon_bounds, 
-                 sss_sst_ssh_data = './data/sss_sst_ssh_anomalies.nc',
-                 mld_data = './data/mldb_full_anomalies_stdanomalies_climatology_stdclimatology.nc',
+                 sss_sst_ssh_data = '../data/sss_sst_ssh_anomalies.nc',
+                 mld_data = '../data/mldb_full_anomalies_stdanomalies_climatology_stdclimatology.nc',
                  anomalies=True, 
-                 CNN = False,
                  half_data = False):
         self.half_data = half_data
         with xr.open_dataset(sss_sst_ssh_data) as ds:
-            print(ds)
             sal = ds.salinity.values.astype(np.float64)
             sal_anom = ds.salinity_anomaly.values.astype(np.float64)
             temp = ds.temperature.values.astype(np.float64)
@@ -59,7 +57,6 @@ class dataset():
             self.i_val  = ds.validation_index.values
 
         with xr.open_dataset(mld_data) as ds:
-            print(ds)
             mldb = ds.copy()
             self.y_week = mldb['week']
 
@@ -70,19 +67,24 @@ class dataset():
             self.X_data = np.stack((sal, temp, height), axis=-1)
             self.y_data = mldb['mldb']
 
-
         lat_mask = (lat < lat_bounds[1]) & (lat > lat_bounds[0])
         lon_mask = (lon < lon_bounds[1]) & (lon > lon_bounds[0])
+        y_dim = int(np.sum(lat_mask))
+        x_dim = int(np.sum(lon_mask))
+        
         self.mask = np.isfinite(self.X_data[:, :, :, 0].mean(axis=0))
-        if CNN:
-            self.X_data[:, ~self.mask, :] = 0.0
-            self.mask = np.isfinite(self.X_data[:, :, :, 0].mean(axis=0))
+        
+        self.X_data[:, ~self.mask, :] = 0.0
+        self.mask = np.isfinite(self.X_data[:, :, :, 0].mean(axis=0))
         self.mask[~lat_mask, :] = False
         self.mask[:, ~lon_mask] = False
         self.X_data = self.X_data[:, self.mask, :]
-
+        self.X_data = self.X_data.reshape(-1, y_dim, x_dim, 3)
+        
         [LAT, LON] = np.meshgrid(lat, lon, indexing='ij')
-        self.X_loc = np.stack((LON[self.mask], LAT[self.mask]), axis=-1)
+        x_lon = LON[self.mask].reshape(y_dim, x_dim)
+        x_lat = LAT[self.mask].reshape(y_dim, x_dim)
+        self.X_loc = np.stack((x_lon, x_lat), axis=-1)
 
         self.y_data = self.y_data.where(
             (mldb.lat < lat_bounds[1]) & (mldb.lat > lat_bounds[0]) & \
@@ -103,7 +105,7 @@ class dataset():
 
         self.lat_bounds = lat_bounds
         self.lon_bounds = lon_bounds
-
+        
         if self.half_data == True:
             from numpy.random import RandomState
             prng = RandomState(24)

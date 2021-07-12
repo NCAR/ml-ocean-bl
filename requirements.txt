@@ -9,3 +9,6 @@ matplotlib
 jupyter
 jupyterlab
 netcdf4
+properscoring
+basemap
+scikit-learn

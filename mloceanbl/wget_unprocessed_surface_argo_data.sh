@@ -7,6 +7,6 @@
 
 
 wget  --user=USERNAME --password=PASSWORD -r -np -nH -nd "*.nc" "https://podaac-tools.jpl.nasa.gov/drive/files/allData/ghrsst/data/GDS2/L4/GLOB/REMSS/mw_OI/v5.0/" -P ../notebooks/data/sst 
-wget  --user=USERNAME --password=PASSWORD -nH -nd -r -np "*.nc" "https://podaac-tools.jpl.nasa.gov/drive/files/allData/ghrsst/data/GDS2/L4/GLOB/REMSS/mw_OI/v5.0/" -P ../notebooks/data/sst 
+wget  --user=USERNAME --password=PASSWORD -nH -nd -r -np "*.nc" "https://podaac-tools.jpl.nasa.gov/drive/files/allData/merged_alt/L4/cdr_grid" -P ../notebooks/data/ssh 
 wget  --user=USERNAME --password=PASSWORD -nH -nd -r -np ".*nc" "https://podaac-tools.jpl.nasa.gov/drive/files/SalinityDensity/aquarius/L4/IPRC/v5/7day" -P ../notebooks/data/sss 
 wget "https://zenodo.org/record/4291175/files/mldbmax.nc?download=1" ../notebooks/data

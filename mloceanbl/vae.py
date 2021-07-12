@@ -110,14 +110,8 @@ class VAE(keras.Model):
 
         
     def call(self, X_d):
-        r"""
-        Produces an estimate x for the latent variable x = f(X) + noise
-        With that estimate x, projects to the output space m = Lx + var
-        where the loss is calculated as l = (y_d - mean)(y_d - mean)/var
-        outputs x, mean and var
-        """
         
-        ## ANN Map
+        ## VAE
         self.X_d = tf.cast(tf.reshape(X_d, [1,-1]), dtype='float64')
         self.mean, self.logvar = self.encode(self.X_d)
         self.z = self.reparameterize(self.mean, self.logvar)
@@ -128,8 +122,15 @@ class VAE(keras.Model):
         x = tf.reshape(x, (-1, ))
         return x
     
-    def log_prob(self, y_pred, y_l, y_true):
-        self.m, self.v = self.gp(y_pred, y_l, noise = self.noise)
+    def log_prob(self, y_pred, y_l, y_true, var = None, batch_num = None, training = True):
+        r"""
+        Computes the gaussian process log-likelihood of the data given
+        the estimate y_pred (or x from self.call(...) ). self.sample
+        is produced for other metric purposes (see ./train.py)
+        """
+        if var is None:
+            var = self.var
+        self.m, self.v = self.gp(y_pred, y_l, noise = var, training = training)
         self.sample = self.gp.sample()
         loss = -self.gp.log_prob( y_true )
         loss += tf.math.reduce_sum((self.X_d - self.xp)**2)

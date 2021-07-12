@@ -91,27 +91,22 @@ class ANN_dropout(keras.Model):
         z = X_d + eps
         return self.L(z, training=training)
         
-    def call(self, X_d, training=True):
-        r"""
-        Produces an estimate x for the latent variable x = f(X) + noise
-        With that estimate x, projects to the output space m = Lx + var
-        where the loss is calculated as l = (y_d - mean)(y_d - mean)/var
-        outputs x, mean and var
-        """
-        
+    def call(self, X_d, training=True):       
         ## ANN Map
         x_samp = self.monte_carlo_sample(tf.cast(tf.reshape(X_d, [1,-1]), dtype='float64'), training=True)
         x = tf.math.reduce_mean(x_samp, axis=0)
-        self.noise = tf.math.reduce_mean((x - x_samp), axis=0)
+        self.var = tf.math.reduce_mean((x - x_samp), axis=0)
         return x
     
-    def log_prob(self, y_pred, y_l, y_true):
+    def log_prob(self, y_pred, y_l, y_true, var = None, batch_num = None, training = True):
         r"""
         Computes the gaussian process log-likelihood of the data given
         the estimate y_pred (or x from self.call(...) ). self.sample
         is produced for other metric purposes (see ./train.py)
         """
-        self.m, self.v = self.gp(y_pred, y_l, noise = self.noise)
+        if var is None:
+            var = self.var
+        self.m, self.v = self.gp(y_pred, y_l, noise = var, training = training)
         self.sample = self.gp.sample()
         loss = -self.gp.log_prob( y_true )
         loss += tf.math.reduce_mean(self.L.losses)
